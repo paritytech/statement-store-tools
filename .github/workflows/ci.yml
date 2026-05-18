@@ -76,11 +76,13 @@ jobs:
         run: |
           forklift cargo build --locked --release \
             --bin statement-latency-bench \
+            --bin statement-ops-bench \
             --bin setup-allowances
       - name: pack artifacts
         run: |
           mkdir -p ./artifacts
           mv ./target/release/statement-latency-bench ./artifacts/.
+          mv ./target/release/statement-ops-bench ./artifacts/.
           mv ./target/release/setup-allowances ./artifacts/.
           echo -n "${{ needs.preflight.outputs.SOURCE_REF_SLUG }}" > ./artifacts/VERSION
           echo -n "${{ needs.preflight.outputs.SOURCE_REF_SLUG }}-${COMMIT_SHA}" > ./artifacts/EXTRATAG

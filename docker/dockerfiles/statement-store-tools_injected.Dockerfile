@@ -39,12 +39,13 @@ RUN apt-get update && \
 
 
 # add statement-store-tools binaries to docker image
-COPY ./artifacts/statement-latency-bench ./artifacts/setup-allowances /usr/local/bin
+COPY ./artifacts/statement-latency-bench ./artifacts/statement-ops-bench ./artifacts/setup-allowances /usr/local/bin
 
 USER nonroot
 
 # check if executables work in this container
 RUN /usr/local/bin/statement-latency-bench --help >/dev/null && \
+	/usr/local/bin/statement-ops-bench --help >/dev/null && \
 	/usr/local/bin/setup-allowances --help >/dev/null
 
 # Tini allows us to avoid several Docker edge cases, see https://github.com/krallin/tini.
