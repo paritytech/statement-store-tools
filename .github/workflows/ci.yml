@@ -25,6 +25,32 @@ jobs:
     needs: isdraft
     uses: paritytech/polkadot-sdk/.github/workflows/reusable-preflight.yml@1a69ade75f028819b70652a25a7ba4e9fa427076
 
+  fmt:
+    needs: preflight
+    runs-on: ${{ needs.preflight.outputs.RUNNER_DEFAULT }}
+    timeout-minutes: 20
+    container:
+      image: ${{ needs.preflight.outputs.IMAGE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: cargo fmt
+        run: cargo +nightly fmt --all -- --check
+
+  clippy:
+    needs: preflight
+    runs-on: ${{ needs.preflight.outputs.RUNNER }}
+    timeout-minutes: 40
+    container:
+      image: ${{ needs.preflight.outputs.IMAGE }}
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: cargo clippy
+        run: forklift cargo clippy --all-targets --locked --quiet
+
   test:
     needs: preflight
     runs-on: ${{ needs.preflight.outputs.RUNNER }}
