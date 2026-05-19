@@ -220,6 +220,12 @@ struct LoopArgs {
 	#[arg(long, default_value = "100")]
 	settle_ms: u64,
 
+	/// Open a fresh WebSocket connection to each endpoint at the start of every
+	/// iteration (after the first). When `false`, the connections opened at
+	/// startup are reused for all iterations.
+	#[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+	new_connection_per_iteration: bool,
+
 	#[command(flatten)]
 	shared: SharedArgs,
 }
@@ -310,11 +316,12 @@ async fn run_subscribe_cmd(args: SubscribeArgs, run_id: u64) -> Result<()> {
 
 async fn run_loop_cmd(args: LoopArgs, run_id: u64) -> Result<()> {
 	let keypair = parse_seed(args.shared.seed.as_deref())?;
-	let endpoints = connect_all(&args.rpc_endpoints).await?;
+	let rpc_endpoints = args.rpc_endpoints.clone();
 	let config = LoopConfig {
 		interval_secs: args.interval_secs,
 		max_iterations: args.iterations,
 		max_duration_secs: args.duration_secs,
+		new_connection_per_iteration: args.new_connection_per_iteration,
 		submit_config: SubmitConfig {
 			iterations: args.submit_iterations,
 			iteration_batch: 1,
@@ -343,13 +350,18 @@ async fn run_loop_cmd(args: LoopArgs, run_id: u64) -> Result<()> {
 		},
 	};
 	info!(
-		"Running loop benchmark: endpoints={} interval={}s max_iterations={:?} max_duration={:?}s",
+		"Running loop benchmark: endpoints={} interval={}s max_iterations={:?} max_duration={:?}s new_connection_per_iteration={}",
 		args.rpc_endpoints.len(),
 		args.interval_secs,
 		args.iterations,
 		args.duration_secs,
+		args.new_connection_per_iteration,
 	);
-	let report = run_loop_with_ctrl_c(&endpoints, &keypair, config).await?;
+	let connector = move || {
+		let urls = rpc_endpoints.clone();
+		async move { connect_all(&urls).await }
+	};
+	let report = run_loop_with_ctrl_c(connector, &keypair, config).await?;
 	info!(
 		"Loop finished: iterations={} stop_reason={:?}",
 		report.iterations_completed, report.stopped_reason,
@@ -526,7 +538,25 @@ mod cli_tests {
 				assert_eq!(a.interval_secs, 5);
 				assert_eq!(a.iterations, Some(3));
 				assert_eq!(a.duration_secs, None);
+				assert!(a.new_connection_per_iteration, "default is true");
 			},
+			_ => panic!("expected loop"),
+		}
+	}
+
+	#[test]
+	fn loop_new_connection_per_iteration_can_be_disabled() {
+		let cli = Cli::try_parse_from([
+			"statement-ops-bench",
+			"loop",
+			"--rpc-endpoints",
+			"ws://x",
+			"--new-connection-per-iteration",
+			"false",
+		])
+		.expect("parse");
+		match cli.command {
+			Command::Loop(a) => assert!(!a.new_connection_per_iteration),
 			_ => panic!("expected loop"),
 		}
 	}
