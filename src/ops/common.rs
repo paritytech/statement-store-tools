@@ -21,7 +21,7 @@
 use anyhow::{anyhow, Result};
 use futures::{Stream, StreamExt};
 use sc_statement_store::test_utils::get_keypair;
-use sp_core::{blake2_256, sr25519, Pair};
+use sp_core::{blake2_256, sr25519, Bytes, Pair};
 use sp_statement_store::{Statement, StatementEvent};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -195,6 +195,67 @@ where
 		Ok(Some(Err(e))) => Err(anyhow!("Subscription stream error: {e}")),
 		Ok(None) => Err(anyhow!("Subscription closed before delivering statement")),
 		Err(_) => Err(anyhow!("Timed out waiting for statement after {timeout:?}")),
+	}
+}
+
+/// Consume the initial dump of a statement subscription, returning the encoded
+/// statement payloads (not just their count, unlike [`drain_initial_batch`]).
+///
+/// Retaining the payloads lets callers detect duplicate delivery by identity.
+/// The dump boundary (`remaining = Some(0)` or `None`) is honoured exactly as in
+/// [`drain_initial_batch`]; the first live event after the boundary is left
+/// unconsumed.
+pub async fn collect_initial_dump<S>(stream: &mut S, timeout: Duration) -> Result<Vec<Bytes>>
+where
+	S: Stream<Item = anyhow::Result<StatementEvent>> + Unpin,
+{
+	let mut out = Vec::new();
+	loop {
+		let next = match tokio::time::timeout(timeout, stream.next()).await {
+			Ok(Some(Ok(event))) => event,
+			Ok(Some(Err(e))) => {
+				return Err(anyhow!("Subscription stream error during initial dump: {e}"))
+			},
+			Ok(None) => return Err(anyhow!("Subscription closed before initial dump completed")),
+			Err(_) => return Err(anyhow!("Initial dump timed out after {timeout:?}")),
+		};
+
+		match next {
+			StatementEvent::NewStatements { statements, remaining } => {
+				out.extend(statements);
+				match remaining {
+					Some(0) | None => return Ok(out),
+					Some(_) => continue,
+				}
+			},
+		}
+	}
+}
+
+/// Keep reading statements until `idle_window` elapses without a new event (or
+/// the stream closes), returning every payload seen in that window.
+///
+/// Unlike the initial-dump drain, a timeout here is the *normal* terminal
+/// condition — it means "no further deliveries" — so it is reported as success
+/// (an empty/partial collection), not an error. Used after
+/// [`collect_initial_dump`] to catch any duplicate or live re-delivery of an
+/// already-dumped statement.
+pub async fn collect_until_idle<S>(stream: &mut S, idle_window: Duration) -> Result<Vec<Bytes>>
+where
+	S: Stream<Item = anyhow::Result<StatementEvent>> + Unpin,
+{
+	let mut out = Vec::new();
+	loop {
+		match tokio::time::timeout(idle_window, stream.next()).await {
+			Ok(Some(Ok(StatementEvent::NewStatements { statements, .. }))) => {
+				out.extend(statements);
+			},
+			Ok(Some(Err(e))) => {
+				return Err(anyhow!("Subscription stream error while watching for duplicates: {e}"))
+			},
+			// Stream closed or idle window elapsed: no further deliveries.
+			Ok(None) | Err(_) => return Ok(out),
+		}
 	}
 }
 
@@ -442,6 +503,65 @@ mod tests {
 			tokio::time::advance(timeout + Duration::from_millis(1)).await;
 		});
 		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn collect_initial_dump_returns_payloads_and_stops_at_boundary() {
+		let events = vec![
+			Ok(ev(Some(1), 2)),
+			Ok(ev(Some(0), 1)),
+			// Trailing live event must not be consumed.
+			Ok(ev(None, 9)),
+		];
+		let mut s = stream::iter(events);
+		let dump = collect_initial_dump(&mut s, Duration::from_secs(1)).await.unwrap();
+		assert_eq!(dump.len(), 3, "two-statement event + one-statement event");
+		let leftover = s.next().await.unwrap().unwrap();
+		match leftover {
+			StatementEvent::NewStatements { statements, .. } => assert_eq!(statements.len(), 9),
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn collect_initial_dump_times_out() {
+		let mut s = stream::pending::<anyhow::Result<StatementEvent>>();
+		let timeout = Duration::from_millis(50);
+		let fut = collect_initial_dump(&mut s, timeout);
+		tokio::pin!(fut);
+		let (result, _) = tokio::join!(fut, async {
+			tokio::time::advance(timeout + Duration::from_millis(1)).await;
+		});
+		assert!(result.is_err());
+	}
+
+	#[tokio::test]
+	async fn collect_until_idle_collects_until_stream_closes() {
+		let events = vec![Ok(ev(None, 2)), Ok(ev(None, 3))];
+		let mut s = stream::iter(events);
+		let got = collect_until_idle(&mut s, Duration::from_secs(1)).await.unwrap();
+		assert_eq!(got.len(), 5);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn collect_until_idle_returns_collected_on_idle() {
+		// One event, then the stream stalls forever: the idle window should fire
+		// and return exactly the one collected statement (not an error).
+		let mut s = stream::iter(vec![Ok(ev(None, 1))])
+			.chain(stream::pending::<anyhow::Result<StatementEvent>>());
+		let window = Duration::from_millis(50);
+		let fut = collect_until_idle(&mut s, window);
+		tokio::pin!(fut);
+		let (got, _) = tokio::join!(fut, async {
+			tokio::time::advance(window + Duration::from_millis(1)).await;
+		});
+		assert_eq!(got.unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn collect_until_idle_propagates_stream_error() {
+		let events = vec![Ok(ev(None, 1)), Err(anyhow!("boom"))];
+		let mut s = stream::iter(events);
+		assert!(collect_until_idle(&mut s, Duration::from_secs(1)).await.is_err());
 	}
 
 	#[test]

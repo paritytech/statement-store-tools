@@ -27,16 +27,18 @@
 
 use crate::ops::{
 	common::{
-		build_statement, calc_stats, derive_channel, derive_topic, drain_initial_batch,
-		expiry_seconds_from_now, next_statement_batch, Clock, Stats, SystemClock,
+		build_statement, calc_stats, collect_initial_dump, collect_until_idle, derive_channel,
+		derive_topic, drain_initial_batch, expiry_seconds_from_now, next_statement_batch, Clock,
+		Stats, SystemClock,
 	},
 	rpc::StatementRpc,
 };
 use anyhow::Result;
 use log::{info, warn};
-use sp_core::{bounded_vec::BoundedVec, sr25519, ConstU32};
+use sp_core::{bounded_vec::BoundedVec, sr25519, Bytes, ConstU32};
 use sp_statement_store::{SubmitResult, Topic, TopicFilter};
 use std::{
+	collections::HashMap,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -54,6 +56,12 @@ pub struct SubscribeConfig {
 	/// scoped to it. Useful for measuring retrieval of statements that already
 	/// exist in the store under a known topic.
 	pub topic_override: Option<[u8; 32]>,
+	/// When set (requires `topic_override`), each read asserts the subscription
+	/// delivers the statement *exactly once*: it drains the initial dump, then
+	/// watches one further `drain_timeout_ms` idle window for any duplicate or
+	/// live re-delivery, and fails the read unless exactly one statement was
+	/// received in total.
+	pub assert_once: bool,
 }
 
 impl SubscribeConfig {
@@ -62,6 +70,10 @@ impl SubscribeConfig {
 		anyhow::ensure!(self.message_size > 0, "--message-size must be > 0");
 		anyhow::ensure!(self.base_expiry_secs > 0, "--base-expiry-secs must be > 0");
 		anyhow::ensure!(self.drain_timeout_ms > 0, "--drain-timeout-ms must be > 0");
+		anyhow::ensure!(
+			!self.assert_once || self.topic_override.is_some(),
+			"--assert-once requires --topic (it asserts on a known topic; it never seeds)"
+		);
 		Ok(())
 	}
 }
@@ -88,6 +100,9 @@ pub struct SubscribeEndpointReport {
 	pub failures: u32,
 	pub first_error: Option<String>,
 	pub seed_status: SeedStatus,
+	/// Whether this run was in `--assert-once` mode. Controls whether the
+	/// summary line spells out the exactly-once result.
+	pub assert_once: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -97,10 +112,10 @@ pub struct SubscribeReport {
 }
 
 fn topic_filter_from(topic: [u8; 32]) -> Result<TopicFilter> {
-	let topics: BoundedVec<Topic, ConstU32<128>> = vec![Topic::from(topic)]
+	let topics: BoundedVec<Topic, ConstU32<4>> = vec![Topic::from(topic)]
 		.try_into()
 		.map_err(|_| anyhow::anyhow!("Failed to build BoundedVec for topic filter"))?;
-	Ok(TopicFilter::MatchAny(topics))
+	Ok(TopicFilter::MatchAll(topics))
 }
 
 pub async fn run_subscribe(
@@ -169,6 +184,7 @@ async fn run_subscribe_on_endpoint(
 				failures: 1,
 				first_error: Some(e.to_string()),
 				seed_status: SeedStatus::Failed,
+				assert_once: config.assert_once,
 			}
 		},
 	};
@@ -183,7 +199,11 @@ async fn run_subscribe_on_endpoint(
 	// every attempt so the stats reflect failure latencies (e.g. drain
 	// timeouts) as well as successes.
 	for _ in 0..config.reads_per_node {
-		let (outcome, elapsed) = run_single_read(rpc, topic, config).await;
+		let (outcome, elapsed) = if config.assert_once {
+			run_assert_once_read(rpc, topic, config).await
+		} else {
+			run_single_read(rpc, topic, config).await
+		};
 		durations_secs.push(elapsed.as_secs_f64());
 		match outcome {
 			Ok(()) => successes += 1,
@@ -203,6 +223,7 @@ async fn run_subscribe_on_endpoint(
 		failures,
 		first_error,
 		seed_status,
+		assert_once: config.assert_once,
 	}
 }
 
@@ -275,16 +296,109 @@ async fn run_single_read(
 	(outcome, t_start.elapsed())
 }
 
+/// Read for `--assert-once`: open one subscription, drain the initial dump, then
+/// watch one idle window for any further (duplicate or live) delivery, and
+/// assert the statement was received exactly once.
+///
+/// The reported latency covers subscribe-open → initial-dump completion (so it
+/// stays comparable to the normal read path); the trailing idle window used for
+/// duplicate detection is deliberately excluded from the timer.
+async fn run_assert_once_read(
+	rpc: &dyn StatementRpc,
+	topic: [u8; 32],
+	config: &SubscribeConfig,
+) -> (Result<()>, Duration) {
+	let filter = match topic_filter_from(topic) {
+		Ok(f) => f,
+		Err(e) => return (Err(e), Duration::ZERO),
+	};
+	let window = Duration::from_millis(config.drain_timeout_ms);
+
+	let t_start = Instant::now();
+	let setup = async {
+		let mut stream = rpc.subscribe_topic(filter).await?;
+		let initial = collect_initial_dump(&mut stream, window).await?;
+		Ok::<_, anyhow::Error>((stream, initial))
+	}
+	.await;
+	let elapsed = t_start.elapsed();
+
+	let (mut stream, mut received) = match setup {
+		Ok(v) => v,
+		Err(e) => return (Err(e), elapsed),
+	};
+
+	// A matching statement should appear once in the dump and never again.
+	// Watch one idle window (untimed) for a duplicate or live re-delivery.
+	let outcome = async {
+		let extra = collect_until_idle(&mut stream, window).await?;
+		received.extend(extra);
+		assert_exactly_once(&received, &topic)
+	}
+	.await;
+
+	(outcome, elapsed)
+}
+
+/// Succeeds iff exactly one statement was received. Otherwise reports a
+/// diagnostic that distinguishes "absent" (0), "duplicated" (one identity seen
+/// multiple times) and "multiple distinct statements".
+fn assert_exactly_once(received: &[Bytes], topic: &[u8; 32]) -> Result<()> {
+	if received.len() == 1 {
+		return Ok(());
+	}
+	if received.is_empty() {
+		anyhow::bail!("topic 0x{}: no statement received; expected exactly one", hex_full(topic));
+	}
+	let mut counts: HashMap<&[u8], usize> = HashMap::new();
+	for b in received {
+		*counts.entry(b.0.as_slice()).or_default() += 1;
+	}
+	let distinct = counts.len();
+	let max_repeat = counts.values().copied().max().unwrap_or(0);
+	anyhow::bail!(
+		"topic 0x{}: received {} statements (distinct={distinct}, max_repeat={max_repeat}); \
+		 expected exactly one",
+		hex_full(topic),
+		received.len(),
+	)
+}
+
+fn hex_full(bytes: &[u8; 32]) -> String {
+	let mut s = String::with_capacity(64);
+	for b in bytes {
+		s.push_str(&format!("{b:02x}"));
+	}
+	s
+}
+
+/// Human-readable summary of the `--assert-once` outcome, appended to the
+/// endpoint log line so success spells out the exactly-once result rather than
+/// leaving it implicit in `ok=`. Empty when assert-once was not requested.
+fn assert_once_suffix(r: &SubscribeEndpointReport) -> String {
+	if !r.assert_once {
+		return String::new();
+	}
+	match (r.failures, r.successes) {
+		(0, 1) => " assert_once=PASS: received the statement exactly once".to_string(),
+		(0, n) if n > 1 => {
+			format!(" assert_once=PASS: received the statement exactly once on each of {n} reads")
+		},
+		_ => " assert_once=FAIL: statement not received exactly once".to_string(),
+	}
+}
+
 fn log_endpoint_report(tag: &str, r: &SubscribeEndpointReport) {
 	let err_suffix = r
 		.first_error
 		.as_ref()
 		.map(|e| format!(" first_error=\"{e}\""))
 		.unwrap_or_default();
+	let assert_suffix = assert_once_suffix(r);
 	match &r.stats {
 		Some(s) => {
 			let line = format!(
-				"{tag}subscribe endpoint={} ok={} fail={} min={:.4}s avg={:.4}s max={:.4}s n={} seed={:?}{}",
+				"{tag}subscribe endpoint={} ok={} fail={} min={:.4}s avg={:.4}s max={:.4}s n={} seed={:?}{}{}",
 				r.endpoint,
 				r.successes,
 				r.failures,
@@ -293,6 +407,7 @@ fn log_endpoint_report(tag: &str, r: &SubscribeEndpointReport) {
 				s.max,
 				s.count,
 				r.seed_status,
+				assert_suffix,
 				err_suffix,
 			);
 			if r.failures > 0 {
@@ -334,6 +449,23 @@ mod tests {
 			settle_ms: 0,
 			drain_timeout_ms: 500,
 			topic_override: None,
+			assert_once: false,
+		}
+	}
+
+	fn cfg_assert_once(drain_ms: u64) -> SubscribeConfig {
+		SubscribeConfig {
+			topic_override: Some([0x42u8; 32]),
+			assert_once: true,
+			drain_timeout_ms: drain_ms,
+			..cfg(1)
+		}
+	}
+
+	fn dump_with(payloads: Vec<Vec<u8>>, remaining: Option<u32>) -> StatementEvent {
+		StatementEvent::NewStatements {
+			statements: payloads.into_iter().map(Bytes).collect(),
+			remaining,
 		}
 	}
 
@@ -453,8 +585,8 @@ mod tests {
 		let topics: Vec<_> = filters
 			.iter()
 			.map(|f| match f {
-				TopicFilter::MatchAny(ts) => ts.to_vec(),
-				_ => panic!("expected MatchAny filter"),
+				TopicFilter::MatchAll(ts) => ts.to_vec(),
+				_ => panic!("expected MatchAll filter"),
 			})
 			.collect();
 		assert!(topics.windows(2).all(|w| w[0] == w[1]), "topic must be the same across reads");
@@ -507,11 +639,11 @@ mod tests {
 		// Every read filters on the override topic.
 		for f in mock.captured_filters() {
 			match f {
-				TopicFilter::MatchAny(ts) => {
+				TopicFilter::MatchAll(ts) => {
 					assert_eq!(ts.len(), 1);
 					assert_eq!(ts[0].0, override_topic);
 				},
-				other => panic!("expected MatchAny filter, got {other:?}"),
+				other => panic!("expected MatchAll filter, got {other:?}"),
 			}
 		}
 	}
@@ -605,5 +737,132 @@ mod tests {
 	#[tokio::test]
 	async fn validate_rejects_zero_reads() {
 		assert!(cfg(0).validate().is_err());
+	}
+
+	#[test]
+	fn validate_rejects_assert_once_without_topic() {
+		let mut c = cfg(1);
+		c.assert_once = true; // topic_override stays None
+		assert!(c.validate().is_err());
+	}
+
+	#[tokio::test]
+	async fn assert_once_passes_on_single_delivery() {
+		let (name, rpc, mock) = make_mock();
+		// One statement in the initial dump; the mock stream then ends, so the
+		// idle watch returns immediately with nothing extra.
+		mock.push_subscribe_events(vec![Ok(dump_with(vec![vec![1, 2, 3]], Some(0)))]);
+		let kp = sc_statement_store::test_utils::get_keypair(0);
+		let clock = FixedClock(3_000_000);
+		let report = run_subscribe(&[(name, rpc)], &kp, &clock, &cfg_assert_once(200), "")
+			.await
+			.unwrap();
+		let r = &report.per_endpoint[0];
+		assert_eq!(r.seed_status, SeedStatus::NotSeeded);
+		assert_eq!(r.successes, 1);
+		assert_eq!(r.failures, 0);
+		assert!(r.assert_once, "report must record assert-once mode for the log line");
+		assert_eq!(mock.submit_count(), 0, "assert-once must never seed");
+	}
+
+	#[tokio::test]
+	async fn assert_once_fails_on_duplicate_redelivery() {
+		let (name, rpc, mock) = make_mock();
+		// Same payload appears in the dump AND again as a later live event.
+		mock.push_subscribe_events(vec![
+			Ok(dump_with(vec![vec![7, 7]], Some(0))),
+			Ok(dump_with(vec![vec![7, 7]], None)),
+		]);
+		let kp = sc_statement_store::test_utils::get_keypair(0);
+		let clock = FixedClock(3_000_000);
+		let report = run_subscribe(&[(name, rpc)], &kp, &clock, &cfg_assert_once(200), "")
+			.await
+			.unwrap();
+		let r = &report.per_endpoint[0];
+		assert_eq!(r.successes, 0);
+		assert_eq!(r.failures, 1);
+		let err = r.first_error.as_ref().unwrap();
+		assert!(err.contains("received 2"), "{err}");
+		assert!(err.contains("max_repeat=2"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn assert_once_fails_on_multiple_distinct_statements() {
+		let (name, rpc, mock) = make_mock();
+		mock.push_subscribe_events(vec![Ok(dump_with(vec![vec![1], vec![2]], Some(0)))]);
+		let kp = sc_statement_store::test_utils::get_keypair(0);
+		let clock = FixedClock(3_000_000);
+		let report = run_subscribe(&[(name, rpc)], &kp, &clock, &cfg_assert_once(200), "")
+			.await
+			.unwrap();
+		let r = &report.per_endpoint[0];
+		assert_eq!(r.failures, 1);
+		let err = r.first_error.as_ref().unwrap();
+		assert!(err.contains("received 2"), "{err}");
+		assert!(err.contains("distinct=2"), "{err}");
+	}
+
+	#[tokio::test]
+	async fn assert_once_fails_when_absent() {
+		let (name, rpc, mock) = make_mock();
+		mock.push_subscribe_events(vec![Ok(dump_with(vec![], Some(0)))]);
+		let kp = sc_statement_store::test_utils::get_keypair(0);
+		let clock = FixedClock(3_000_000);
+		let report = run_subscribe(&[(name, rpc)], &kp, &clock, &cfg_assert_once(200), "")
+			.await
+			.unwrap();
+		let r = &report.per_endpoint[0];
+		assert_eq!(r.successes, 0);
+		assert_eq!(r.failures, 1);
+		assert!(r.first_error.as_ref().unwrap().contains("no statement received"));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn assert_once_passes_when_subscription_stays_open() {
+		// One statement in the dump, then the (live) subscription stalls: the
+		// idle window must fire and still count exactly one delivery.
+		let (name, rpc, mock) = make_mock();
+		mock.push_subscribe_events_then_pending(vec![Ok(dump_with(vec![vec![9]], Some(0)))]);
+		let kp = sc_statement_store::test_utils::get_keypair(0);
+		let clock = FixedClock(3_000_000);
+		let config = cfg_assert_once(50);
+		let endpoints = vec![(name, rpc)];
+		let fut = run_subscribe(&endpoints, &kp, &clock, &config, "");
+		tokio::pin!(fut);
+		let (report, _) = tokio::join!(fut, async {
+			tokio::time::advance(Duration::from_millis(200)).await;
+		});
+		let r = &report.unwrap().per_endpoint[0];
+		assert_eq!(r.successes, 1);
+		assert_eq!(r.failures, 0);
+		assert_eq!(mock.submit_count(), 0);
+	}
+
+	#[test]
+	fn assert_once_suffix_wording() {
+		let base = SubscribeEndpointReport {
+			endpoint: "ep".into(),
+			stats: None,
+			successes: 0,
+			failures: 0,
+			first_error: None,
+			seed_status: SeedStatus::NotSeeded,
+			assert_once: true,
+		};
+		let pass1 = SubscribeEndpointReport { successes: 1, ..base.clone() };
+		assert_eq!(
+			assert_once_suffix(&pass1),
+			" assert_once=PASS: received the statement exactly once"
+		);
+
+		let pass_many = SubscribeEndpointReport { successes: 3, ..base.clone() };
+		assert!(assert_once_suffix(&pass_many).contains("exactly once on each of 3 reads"));
+
+		let failed = SubscribeEndpointReport { failures: 1, ..base.clone() };
+		assert!(assert_once_suffix(&failed).contains("FAIL"));
+
+		// Not requested → no suffix, even on a clean single read.
+		let off = SubscribeEndpointReport { successes: 1, assert_once: false, ..base };
+		assert_eq!(assert_once_suffix(&off), "");
 	}
 }

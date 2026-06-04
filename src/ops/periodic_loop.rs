@@ -334,6 +334,7 @@ mod tests {
 				settle_ms: 0,
 				drain_timeout_ms: 100,
 				topic_override: None,
+				assert_once: false,
 			},
 		}
 	}

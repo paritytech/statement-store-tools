@@ -269,7 +269,7 @@ async fn execute_round(
 	for &(count, size) in messages_pattern {
 		for _ in 0..count {
 			let topic = generate_topic(test_run_id, client_id, round, sent_count);
-			let channel = blake2_256(format!("{client_id}-{sent_count}").as_bytes());
+			let channel = blake2_256(format!("{client_id}-{sent_count}-{test_run_id}").as_bytes());
 
 			let expiry_timestamp = (std::time::SystemTime::now()
 				.duration_since(std::time::UNIX_EPOCH)

@@ -169,6 +169,14 @@ struct SubscribeArgs {
 	#[arg(long, value_parser = parse_topic_hex)]
 	topic: Option<[u8; 32]>,
 
+	/// Assert that the subscription delivers the statement exactly once
+	/// (requires `--topic`). Each read drains the initial dump, then watches one
+	/// further `--drain-timeout-ms` idle window for any duplicate or live
+	/// re-delivery, and the process exits non-zero unless every read received
+	/// exactly one statement.
+	#[arg(long, requires = "topic")]
+	assert_once: bool,
+
 	#[command(flatten)]
 	shared: SharedArgs,
 }
@@ -303,14 +311,36 @@ async fn run_subscribe_cmd(args: SubscribeArgs, run_id: u64) -> Result<()> {
 		settle_ms: args.settle_ms,
 		drain_timeout_ms: args.drain_timeout_ms,
 		topic_override: args.topic,
+		assert_once: args.assert_once,
 	};
 	info!(
-		"Running subscribe benchmark: endpoints={} reads_per_node={} msg_size={}B",
+		"Running subscribe benchmark: endpoints={} reads_per_node={} msg_size={}B assert_once={}",
 		args.rpc_endpoints.len(),
 		args.reads_per_node,
 		args.shared.message_size,
+		args.assert_once,
 	);
-	run_subscribe_with_system_clock(&endpoints, &keypair, &config, "").await?;
+	let report = run_subscribe_with_system_clock(&endpoints, &keypair, &config, "").await?;
+
+	// With `--assert-once`, a failed read (absent / duplicated / multiple) must
+	// surface as a non-zero exit so callers and scripts can rely on it.
+	if args.assert_once {
+		let failed: Vec<_> = report.per_endpoint.iter().filter(|r| r.failures > 0).collect();
+		if !failed.is_empty() {
+			let detail = failed
+				.iter()
+				.map(|r| {
+					format!("{}: {}", r.endpoint, r.first_error.as_deref().unwrap_or("read failed"))
+				})
+				.collect::<Vec<_>>()
+				.join("; ");
+			anyhow::bail!(
+				"--assert-once failed on {}/{} endpoint(s): {detail}",
+				failed.len(),
+				report.per_endpoint.len(),
+			);
+		}
+	}
 	Ok(())
 }
 
@@ -347,6 +377,7 @@ async fn run_loop_cmd(args: LoopArgs, run_id: u64) -> Result<()> {
 			settle_ms: args.settle_ms,
 			drain_timeout_ms: args.subscribe_drain_timeout_ms,
 			topic_override: None,
+			assert_once: false,
 		},
 	};
 	info!(
@@ -630,6 +661,51 @@ mod cli_tests {
 				let t = a.topic.expect("topic set");
 				assert_eq!(&t[..4], &[0xCA, 0xFE, 0xBA, 0xBE]);
 			},
+			_ => panic!("expected subscribe"),
+		}
+	}
+
+	#[test]
+	fn subscribe_parses_assert_once() {
+		let cli = Cli::try_parse_from([
+			"statement-ops-bench",
+			"subscribe",
+			"--rpc-endpoints",
+			"ws://x",
+			"--topic",
+			"0xCAFEBABECAFEBABECAFEBABECAFEBABECAFEBABECAFEBABECAFEBABECAFEBABE",
+			"--assert-once",
+		])
+		.expect("parse");
+		match cli.command {
+			Command::Subscribe(a) => {
+				assert!(a.assert_once);
+				assert!(a.topic.is_some());
+			},
+			_ => panic!("expected subscribe"),
+		}
+	}
+
+	#[test]
+	fn subscribe_assert_once_requires_topic() {
+		// `--assert-once` without `--topic` must be rejected at parse time.
+		assert!(Cli::try_parse_from([
+			"statement-ops-bench",
+			"subscribe",
+			"--rpc-endpoints",
+			"ws://x",
+			"--assert-once",
+		])
+		.is_err());
+	}
+
+	#[test]
+	fn subscribe_assert_once_defaults_false() {
+		let cli =
+			Cli::try_parse_from(["statement-ops-bench", "subscribe", "--rpc-endpoints", "ws://x"])
+				.expect("parse");
+		match cli.command {
+			Command::Subscribe(a) => assert!(!a.assert_once),
 			_ => panic!("expected subscribe"),
 		}
 	}
