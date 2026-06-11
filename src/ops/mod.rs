@@ -21,6 +21,7 @@
 pub mod common;
 pub mod periodic_loop;
 pub mod propagation;
+pub mod query;
 pub mod rpc;
 pub mod submit;
 pub mod subscribe;

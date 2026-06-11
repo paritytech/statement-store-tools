@@ -19,13 +19,15 @@
 //! Per-node statement-store operation benchmark.
 //!
 //! Complements the cohort-wide `statement-latency-bench` binary by measuring
-//! individual RPC operations on specific nodes. Four subcommands:
+//! individual RPC operations on specific nodes. Five subcommands:
 //!
 //! - `submit`      — `statement_submit` duration on each node.
 //! - `propagation` — submit→subscribe latency for each (submit, subscribe) pair.
 //! - `subscribe`   — retrieval latency via `statement_subscribeStatement` on a previously-submitted
 //!   statement.
 //! - `loop`        — periodically run the above.
+//! - `query`       — list statements currently in the store (optionally by topic), sorted by
+//!   expiry.
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -38,6 +40,7 @@ use ops::{
 	common::{parse_seed, parse_topic_hex},
 	periodic_loop::{run_loop_with_ctrl_c, LoopConfig},
 	propagation::{run_propagation_with_system_clock, PropagationConfig},
+	query::{filter_label, run_query_with_system_clock, QueryConfig},
 	rpc::{StatementRpc, WsClientRpc},
 	submit::{run_submit_with_system_clock, SubmitConfig},
 	subscribe::{run_subscribe_with_system_clock, SubscribeConfig},
@@ -62,6 +65,9 @@ enum Command {
 	/// Periodically run all three scenarios.
 	#[command(name = "loop")]
 	Loop(LoopArgs),
+	/// List statements currently in the store (optionally filtered by topic),
+	/// sorted by the time they will expire (soonest first).
+	Query(QueryArgs),
 }
 
 #[derive(Args, Debug)]
@@ -238,6 +244,26 @@ struct LoopArgs {
 	shared: SharedArgs,
 }
 
+#[derive(Args, Debug)]
+struct QueryArgs {
+	/// Comma-separated list of WebSocket RPC endpoints.
+	#[arg(long, value_delimiter = ',', required = true)]
+	rpc_endpoints: Vec<String>,
+
+	/// Optional 32-byte topic in hex (with or without `0x` prefix). When set,
+	/// only statements carrying this topic are listed; otherwise every
+	/// statement in the store is listed.
+	#[arg(long, value_parser = parse_topic_hex)]
+	topic: Option<[u8; 32]>,
+
+	/// Maximum time to wait for each event of the initial subscription dump,
+	/// in ms. A full-store dump can span many events; this bounds the gap
+	/// between consecutive events, not the total time. Dump events carry up to
+	/// ~4 MiB of statements each, so slow WAN links need a generous value.
+	#[arg(long, default_value = "15000")]
+	drain_timeout_ms: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 	let _ = env_logger::try_init_from_env(
@@ -251,6 +277,7 @@ async fn main() -> Result<()> {
 		Command::Propagation(args) => run_propagation_cmd(args, run_id).await,
 		Command::Subscribe(args) => run_subscribe_cmd(args, run_id).await,
 		Command::Loop(args) => run_loop_cmd(args, run_id).await,
+		Command::Query(args) => run_query_cmd(args).await,
 	}
 }
 
@@ -396,6 +423,24 @@ async fn run_loop_cmd(args: LoopArgs, run_id: u64) -> Result<()> {
 	info!(
 		"Loop finished: iterations={} stop_reason={:?}",
 		report.iterations_completed, report.stopped_reason,
+	);
+	Ok(())
+}
+
+async fn run_query_cmd(args: QueryArgs) -> Result<()> {
+	let endpoints = connect_all(&args.rpc_endpoints).await?;
+	let config = QueryConfig { topic: args.topic, drain_timeout_ms: args.drain_timeout_ms };
+	info!(
+		"Running query: endpoints={} filter={} drain_timeout_ms={}",
+		args.rpc_endpoints.len(),
+		filter_label(&args.topic),
+		args.drain_timeout_ms,
+	);
+	let report = run_query_with_system_clock(&endpoints, &config).await?;
+	anyhow::ensure!(
+		!report.all_failed(),
+		"query failed on all {} endpoint(s)",
+		report.per_endpoint.len(),
 	);
 	Ok(())
 }
@@ -744,6 +789,94 @@ mod cli_tests {
 			"ws://a",
 			"--topic",
 			&bad,
+		])
+		.is_err());
+	}
+
+	#[test]
+	fn query_minimal_required_args() {
+		let cli = Cli::try_parse_from([
+			"statement-ops-bench",
+			"query",
+			"--rpc-endpoints",
+			"ws://a,ws://b",
+		])
+		.expect("parse");
+		match cli.command {
+			Command::Query(a) => {
+				assert_eq!(a.rpc_endpoints, vec!["ws://a", "ws://b"]);
+				assert!(a.topic.is_none());
+				assert_eq!(a.drain_timeout_ms, 15000);
+			},
+			_ => panic!("expected query"),
+		}
+	}
+
+	#[test]
+	fn query_parses_topic_and_drain_timeout() {
+		let cli = Cli::try_parse_from([
+			"statement-ops-bench",
+			"query",
+			"--rpc-endpoints",
+			"ws://a",
+			"--topic",
+			"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			"--drain-timeout-ms",
+			"9000",
+		])
+		.expect("parse");
+		match cli.command {
+			Command::Query(a) => {
+				let t = a.topic.expect("topic set");
+				assert_eq!(&t[..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+				assert_eq!(a.drain_timeout_ms, 9000);
+			},
+			_ => panic!("expected query"),
+		}
+	}
+
+	#[test]
+	fn query_rejects_missing_endpoints() {
+		assert!(Cli::try_parse_from(["statement-ops-bench", "query"]).is_err());
+	}
+
+	#[test]
+	fn query_rejects_short_topic() {
+		assert!(Cli::try_parse_from([
+			"statement-ops-bench",
+			"query",
+			"--rpc-endpoints",
+			"ws://a",
+			"--topic",
+			"00",
+		])
+		.is_err());
+	}
+
+	#[test]
+	fn query_rejects_non_hex_topic() {
+		let bad = format!("zz{}", "00".repeat(31));
+		assert!(Cli::try_parse_from([
+			"statement-ops-bench",
+			"query",
+			"--rpc-endpoints",
+			"ws://a",
+			"--topic",
+			&bad,
+		])
+		.is_err());
+	}
+
+	#[test]
+	fn query_rejects_seed_flag() {
+		// `query` is read-only: it deliberately takes no signing/submission args.
+		assert!(Cli::try_parse_from([
+			"statement-ops-bench",
+			"query",
+			"--rpc-endpoints",
+			"ws://a",
+			"--seed",
+			"//Alice",
 		])
 		.is_err());
 	}

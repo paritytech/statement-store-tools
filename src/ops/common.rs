@@ -21,8 +21,8 @@
 use anyhow::{anyhow, Result};
 use futures::{Stream, StreamExt};
 use sc_statement_store::test_utils::get_keypair;
-use sp_core::{blake2_256, sr25519, Bytes, Pair};
-use sp_statement_store::{Statement, StatementEvent};
+use sp_core::{blake2_256, bounded_vec::BoundedVec, sr25519, Bytes, ConstU32, Pair};
+use sp_statement_store::{Statement, StatementEvent, Topic, TopicFilter};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Aggregate latency statistics for a sequence of samples.
@@ -144,6 +144,33 @@ fn hex_nibble(c: u8) -> std::result::Result<u8, String> {
 		b'A'..=b'F' => Ok(c - b'A' + 10),
 		_ => Err(format!("invalid hex character: {:?}", c as char)),
 	}
+}
+
+/// Build a `MatchAll` filter for a single 32-byte topic.
+pub fn single_topic_filter(topic: [u8; 32]) -> Result<TopicFilter> {
+	let topics: BoundedVec<Topic, ConstU32<4>> = vec![Topic::from(topic)]
+		.try_into()
+		.map_err(|_| anyhow!("Failed to build BoundedVec for topic filter"))?;
+	Ok(TopicFilter::MatchAll(topics))
+}
+
+/// Render the first 4 bytes as lowercase hex followed by `..` (for log lines).
+pub fn hex_short(bytes: &[u8; 32]) -> String {
+	let mut s = String::with_capacity(8);
+	for b in &bytes[..4] {
+		s.push_str(&format!("{b:02x}"));
+	}
+	s.push_str("..");
+	s
+}
+
+/// Render all 32 bytes as lowercase hex (no `0x` prefix).
+pub fn hex_full(bytes: &[u8; 32]) -> String {
+	let mut s = String::with_capacity(64);
+	for b in bytes {
+		s.push_str(&format!("{b:02x}"));
+	}
+	s
 }
 
 /// Consume the initial dump of a statement subscription, returning the total
@@ -428,6 +455,36 @@ mod tests {
 	fn parse_topic_hex_rejects_non_hex_chars() {
 		let s = format!("zz{}", "00".repeat(31));
 		assert!(parse_topic_hex(&s).is_err());
+	}
+
+	#[test]
+	fn hex_full_round_trips_with_parse_topic_hex() {
+		let mut topic = [0u8; 32];
+		for (i, b) in topic.iter_mut().enumerate() {
+			*b = (i * 8 + 1) as u8;
+		}
+		let hex = hex_full(&topic);
+		assert_eq!(hex.len(), 64);
+		assert_eq!(parse_topic_hex(&hex).unwrap(), topic);
+	}
+
+	#[test]
+	fn hex_short_renders_first_four_bytes() {
+		let mut topic = [0u8; 32];
+		topic[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+		assert_eq!(hex_short(&topic), "deadbeef..");
+	}
+
+	#[test]
+	fn single_topic_filter_builds_match_all() {
+		let topic = [0x42u8; 32];
+		match single_topic_filter(topic).unwrap() {
+			TopicFilter::MatchAll(ts) => {
+				assert_eq!(ts.len(), 1);
+				assert_eq!(ts[0].0, topic);
+			},
+			other => panic!("expected MatchAll filter, got {other:?}"),
+		}
 	}
 
 	fn ev(remaining: Option<u32>, count: usize) -> StatementEvent {

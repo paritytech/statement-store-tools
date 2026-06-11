@@ -7,7 +7,7 @@ CLI tools for benchmarking statement store latency at scale. The ring-topology b
 This crate produces three binaries:
 - **`setup-allowances`** — one-shot provisioning of on-chain statement allowances via Sudo
 - **`statement-latency-bench`** — cohort/ring-topology latency benchmark
-- **`statement-ops-bench`** — per-node operation benchmark (submit / propagation / subscribe / loop)
+- **`statement-ops-bench`** — per-node operation benchmark (submit / propagation / subscribe / loop / query)
 
 ## Building
 
@@ -101,7 +101,8 @@ receive_max=5.678s latency_min=2.234s latency_avg=3.567s latency_max=5.789s
 
 `statement-ops-bench` measures individual statement-store RPC operations on specific nodes.
 
-Each subcommand requires a signing key with an on-chain statement allowance.
+Each benchmarking subcommand requires a signing key with an on-chain statement allowance;
+`query` is read-only and needs none.
 
 ### `submit` — per-node submit duration
 
@@ -179,6 +180,41 @@ statement-ops-bench loop \
   --reads-per-node 5 \
   --seed "your account seed"
 ```
+
+### `query` — list store contents sorted by expiry
+
+Lists the statements currently held by each node, sorted by the time they will
+expire (soonest first). Read-only: nothing is submitted and no seed is needed.
+
+The public statement RPC has no dump/get method, so the command opens a
+`statement_subscribeStatement` subscription per endpoint, collects the initial
+dump (the replay of everything already in the store that matches the filter)
+and unsubscribes at the dump boundary. The result is a point-in-time snapshot.
+
+```bash
+# All statements on each node, soonest-to-expire first
+statement-ops-bench query \
+  --rpc-endpoints ws://node1:9944,ws://node2:9944
+
+# Only statements carrying a known topic
+statement-ops-bench query \
+  --rpc-endpoints ws://node1:9944 \
+  --topic 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+```
+
+Example output:
+```
+query endpoint=ws://node1:9944 filter=any n=2 undecodable=0 (sorted by expiry, soonest first)
+  [0] hash=0x90b3... expires_at=1765432100 (expires in 9m32s) seq=3 data_len=512 account=0x1c5e... channel=0x7d01... topics=[0xdead...]
+  [1] hash=0x44af... expires_at=1765432700 (expires in 19m32s) seq=0 data_len=512 account=0x1c5e... channel=none topics=[0xbeef...]
+```
+
+`--drain-timeout-ms` (default 15000) bounds the gap between consecutive dump
+events, not the total dump duration. Dump events carry up to ~4 MiB of
+statements each, so the first event of a large dump can take several seconds
+to arrive on WAN links; raise the timeout if a busy node still times out.
+Per-endpoint failures are logged and skipped; the command exits non-zero only
+if every endpoint fails.
 
 ### Output format
 

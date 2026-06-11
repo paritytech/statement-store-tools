@@ -28,15 +28,15 @@
 use crate::ops::{
 	common::{
 		build_statement, calc_stats, collect_initial_dump, collect_until_idle, derive_channel,
-		derive_topic, drain_initial_batch, expiry_seconds_from_now, next_statement_batch, Clock,
-		Stats, SystemClock,
+		derive_topic, drain_initial_batch, expiry_seconds_from_now, hex_full, hex_short,
+		next_statement_batch, single_topic_filter, Clock, Stats, SystemClock,
 	},
 	rpc::StatementRpc,
 };
 use anyhow::Result;
 use log::{info, warn};
-use sp_core::{bounded_vec::BoundedVec, sr25519, Bytes, ConstU32};
-use sp_statement_store::{SubmitResult, Topic, TopicFilter};
+use sp_core::{sr25519, Bytes};
+use sp_statement_store::SubmitResult;
 use std::{
 	collections::HashMap,
 	sync::Arc,
@@ -109,13 +109,6 @@ pub struct SubscribeEndpointReport {
 #[allow(dead_code)]
 pub struct SubscribeReport {
 	pub per_endpoint: Vec<SubscribeEndpointReport>,
-}
-
-fn topic_filter_from(topic: [u8; 32]) -> Result<TopicFilter> {
-	let topics: BoundedVec<Topic, ConstU32<4>> = vec![Topic::from(topic)]
-		.try_into()
-		.map_err(|_| anyhow::anyhow!("Failed to build BoundedVec for topic filter"))?;
-	Ok(TopicFilter::MatchAll(topics))
 }
 
 pub async fn run_subscribe(
@@ -252,21 +245,12 @@ async fn ensure_seed(
 	}
 }
 
-fn hex_short(bytes: &[u8; 32]) -> String {
-	let mut s = String::with_capacity(8);
-	for b in &bytes[..4] {
-		s.push_str(&format!("{b:02x}"));
-	}
-	s.push_str("..");
-	s
-}
-
 async fn run_single_read(
 	rpc: &dyn StatementRpc,
 	topic: [u8; 32],
 	config: &SubscribeConfig,
 ) -> (Result<()>, Duration) {
-	let filter = match topic_filter_from(topic) {
+	let filter = match single_topic_filter(topic) {
 		Ok(f) => f,
 		Err(e) => return (Err(e), Duration::ZERO),
 	};
@@ -308,7 +292,7 @@ async fn run_assert_once_read(
 	topic: [u8; 32],
 	config: &SubscribeConfig,
 ) -> (Result<()>, Duration) {
-	let filter = match topic_filter_from(topic) {
+	let filter = match single_topic_filter(topic) {
 		Ok(f) => f,
 		Err(e) => return (Err(e), Duration::ZERO),
 	};
@@ -362,14 +346,6 @@ fn assert_exactly_once(received: &[Bytes], topic: &[u8; 32]) -> Result<()> {
 		hex_full(topic),
 		received.len(),
 	)
-}
-
-fn hex_full(bytes: &[u8; 32]) -> String {
-	let mut s = String::with_capacity(64);
-	for b in bytes {
-		s.push_str(&format!("{b:02x}"));
-	}
-	s
 }
 
 /// Human-readable summary of the `--assert-once` outcome, appended to the
@@ -438,7 +414,7 @@ mod tests {
 	use super::*;
 	use crate::ops::{common::FixedClock, rpc::MockRpc};
 	use sp_core::Bytes;
-	use sp_statement_store::StatementEvent;
+	use sp_statement_store::{StatementEvent, TopicFilter};
 
 	fn cfg(reads: u32) -> SubscribeConfig {
 		SubscribeConfig {
