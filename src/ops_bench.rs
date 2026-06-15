@@ -32,16 +32,19 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use log::info;
+use sp_statement_store::StatementAllowance;
 use std::sync::Arc;
 
 mod ops;
 
 use ops::{
-	common::{parse_seed, parse_topic_hex},
+	admin::{set_quota, show_quota, SetQuotaConfig, ShowQuotaConfig},
+	common::{hex_full, parse_account, parse_seed, parse_topic_hex},
 	periodic_loop::{run_loop_with_ctrl_c, LoopConfig},
 	propagation::{run_propagation_with_system_clock, PropagationConfig},
 	query::{filter_label, run_query_with_system_clock, QueryConfig},
 	rpc::{StatementRpc, WsClientRpc},
+	signer::{resolve_sudo_keypair, SudoKeyArgs},
 	submit::{run_submit_with_system_clock, SubmitConfig},
 	subscribe::{run_subscribe_with_system_clock, SubscribeConfig},
 };
@@ -68,6 +71,8 @@ enum Command {
 	/// List statements currently in the store (optionally filtered by topic),
 	/// sorted by the time they will expire (soonest first).
 	Query(QueryArgs),
+	/// Show or set the per-account statement-store quota (allowance).
+	Admin(AdminArgs),
 }
 
 #[derive(Args, Debug)]
@@ -264,6 +269,56 @@ struct QueryArgs {
 	drain_timeout_ms: u64,
 }
 
+#[derive(Args, Debug)]
+struct AdminArgs {
+	#[command(subcommand)]
+	action: AdminAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminAction {
+	/// Show the statement-store quota (allowance) for an account.
+	ShowQuota(ShowQuotaArgs),
+	/// Set the statement-store quota (allowance) for an account via a
+	/// sudo-signed `System.set_storage` extrinsic.
+	SetQuota(SetQuotaArgs),
+}
+
+#[derive(Args, Debug)]
+struct ShowQuotaArgs {
+	/// WebSocket RPC endpoint (e.g. ws://127.0.0.1:9944).
+	#[arg(long, required = true)]
+	rpc_endpoint: String,
+
+	/// Account as an SS58 address or 32-byte hex (with or without `0x`).
+	#[arg(long, required = true, value_parser = parse_account)]
+	account: [u8; 32],
+}
+
+#[derive(Args, Debug)]
+struct SetQuotaArgs {
+	/// WebSocket RPC endpoint (e.g. ws://127.0.0.1:9944).
+	#[arg(long, required = true)]
+	rpc_endpoint: String,
+
+	/// Account as an SS58 address or 32-byte hex (with or without `0x`).
+	#[arg(long, required = true, value_parser = parse_account)]
+	account: [u8; 32],
+
+	/// Sudo signing key. Exactly one source is required (`--sudo-seed`,
+	/// `--sudo-seed-file`, or `--sudo-json`).
+	#[command(flatten)]
+	sudo: SudoKeyArgs,
+
+	/// Maximum number of statements allowed for the account.
+	#[arg(long, required = true)]
+	max_count: u32,
+
+	/// Maximum total size of statements, in bytes, for the account.
+	#[arg(long, required = true)]
+	max_size: u32,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 	let _ = env_logger::try_init_from_env(
@@ -278,6 +333,66 @@ async fn main() -> Result<()> {
 		Command::Subscribe(args) => run_subscribe_cmd(args, run_id).await,
 		Command::Loop(args) => run_loop_cmd(args, run_id).await,
 		Command::Query(args) => run_query_cmd(args).await,
+		Command::Admin(args) => run_admin_cmd(args).await,
+	}
+}
+
+async fn run_admin_cmd(args: AdminArgs) -> Result<()> {
+	match args.action {
+		AdminAction::ShowQuota(a) => {
+			let config = ShowQuotaConfig { endpoint: a.rpc_endpoint, account: a.account };
+			let quota = show_quota(&config).await?;
+			log_quota(&config.account, quota.as_ref());
+			Ok(())
+		},
+		AdminAction::SetQuota(a) => {
+			let signer = resolve_sudo_keypair(&a.sudo)?;
+			info!(
+				"Setting quota for account={} to max_count={} max_size={}, signing as account={}",
+				hex_full(&a.account),
+				a.max_count,
+				a.max_size,
+				hex_full(&signer.public_key().0),
+			);
+			let config = SetQuotaConfig {
+				endpoint: a.rpc_endpoint,
+				account: a.account,
+				signer,
+				max_count: a.max_count,
+				max_size: a.max_size,
+			};
+			set_quota(&config).await?;
+
+			// Verify by reading the value back at the latest block.
+			let show = ShowQuotaConfig { endpoint: config.endpoint, account: config.account };
+			let quota = show_quota(&show).await?;
+			log_quota(&show.account, quota.as_ref());
+			match quota {
+				Some(q) if q.max_count == config.max_count && q.max_size == config.max_size => {
+					Ok(())
+				},
+				_ => anyhow::bail!(
+					"Quota read-back did not match requested values (max_count={}, max_size={}) for account={}",
+					config.max_count,
+					config.max_size,
+					hex_full(&show.account),
+				),
+			}
+		},
+	}
+}
+
+/// Log an account's quota (or its absence) on a single line.
+fn log_quota(account: &[u8; 32], quota: Option<&StatementAllowance>) {
+	match quota {
+		Some(q) => info!(
+			"account={} quota: max_count={} max_size={}{}",
+			hex_full(account),
+			q.max_count,
+			q.max_size,
+			if q.max_count == 0 || q.max_size == 0 { " (depleted)" } else { "" },
+		),
+		None => info!("account={} has NO quota set", hex_full(account)),
 	}
 }
 

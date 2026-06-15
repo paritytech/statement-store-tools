@@ -21,7 +21,12 @@
 use anyhow::{anyhow, Result};
 use futures::{Stream, StreamExt};
 use sc_statement_store::test_utils::get_keypair;
-use sp_core::{blake2_256, bounded_vec::BoundedVec, sr25519, Bytes, ConstU32, Pair};
+use sp_core::{
+	blake2_256,
+	bounded_vec::BoundedVec,
+	crypto::{AccountId32, Ss58Codec},
+	sr25519, Bytes, ConstU32, Pair,
+};
 use sp_statement_store::{Statement, StatementEvent, Topic, TopicFilter};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -144,6 +149,45 @@ fn hex_nibble(c: u8) -> std::result::Result<u8, String> {
 		b'A'..=b'F' => Ok(c - b'A' + 10),
 		_ => Err(format!("invalid hex character: {:?}", c as char)),
 	}
+}
+
+/// Parse an account id from either an SS58 address or a 32-byte hex string
+/// (with or without the `0x` prefix).
+///
+/// Used by clap's `value_parser` for the `--account` flag and by tests. Input
+/// is treated as hex when it carries a `0x`/`0X` prefix or is exactly 64 hex
+/// characters; otherwise it is decoded as SS58.
+pub fn parse_account(s: &str) -> std::result::Result<[u8; 32], String> {
+	let trimmed = s.trim();
+	let has_prefix = trimmed.starts_with("0x") || trimmed.starts_with("0X");
+	let hex_body = if has_prefix { &trimmed[2..] } else { trimmed };
+	let looks_like_hex = hex_body.len() == 64 && hex_body.bytes().all(|b| b.is_ascii_hexdigit());
+
+	if has_prefix || looks_like_hex {
+		if hex_body.len() != 64 {
+			return Err(format!(
+				"--account hex must be 64 hex chars (32 bytes), got {} chars",
+				hex_body.len()
+			));
+		}
+		let mut out = [0u8; 32];
+		for (i, chunk) in hex_body.as_bytes().chunks(2).enumerate() {
+			let hi = hex_nibble(chunk[0])?;
+			let lo = hex_nibble(chunk[1])?;
+			out[i] = (hi << 4) | lo;
+		}
+		return Ok(out);
+	}
+
+	let account = AccountId32::from_ss58check(trimmed).map_err(|e| {
+		format!(
+			"--account must be an SS58 address or 32-byte hex (with or without 0x); \
+			 {trimmed:?} is neither ({e:?})"
+		)
+	})?;
+	let mut out = [0u8; 32];
+	out.copy_from_slice(account.as_ref());
+	Ok(out)
 }
 
 /// Build a `MatchAll` filter for a single 32-byte topic.
@@ -455,6 +499,36 @@ mod tests {
 	fn parse_topic_hex_rejects_non_hex_chars() {
 		let s = format!("zz{}", "00".repeat(31));
 		assert!(parse_topic_hex(&s).is_err());
+	}
+
+	#[test]
+	fn parse_account_ss58_decodes_and_roundtrips() {
+		// Canonical //Alice sr25519 account, verifying SS58 decoding is real
+		// (not just self-consistent) by re-encoding back to the same address.
+		let ss58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+		let bytes = parse_account(ss58).unwrap();
+		assert_eq!(AccountId32::from(bytes).to_ss58check(), ss58);
+	}
+
+	#[test]
+	fn parse_account_hex_and_ss58_agree() {
+		let ss58 = "5DA1vuQ442HZQMkpk5idSUiQGrhJ6fkzW1rxETB7QviHvVRi";
+		let from_ss58 = parse_account(ss58).unwrap();
+		// The 0x-prefixed and bare hex forms of the same account must parse
+		// to identical bytes.
+		let hex = hex_full(&from_ss58);
+		assert_eq!(parse_account(&format!("0x{hex}")).unwrap(), from_ss58);
+		assert_eq!(parse_account(&hex).unwrap(), from_ss58);
+		assert_eq!(parse_account(&format!("0X{hex}")).unwrap(), from_ss58);
+	}
+
+	#[test]
+	fn parse_account_rejects_garbage() {
+		assert!(parse_account("not-an-account").is_err());
+		// 0x-prefixed but wrong length.
+		assert!(parse_account("0x1234").is_err());
+		// 0x-prefixed, right length, but non-hex characters.
+		assert!(parse_account(&format!("0x{}", "z".repeat(64))).is_err());
 	}
 
 	#[test]

@@ -18,10 +18,12 @@
 
 //! Modules for the `statement-ops-bench` binary.
 
+pub mod admin;
 pub mod common;
 pub mod periodic_loop;
 pub mod propagation;
 pub mod query;
 pub mod rpc;
+pub mod signer;
 pub mod submit;
 pub mod subscribe;
