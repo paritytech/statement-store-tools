@@ -7,7 +7,7 @@ CLI tools for benchmarking statement store latency at scale. The ring-topology b
 This crate produces three binaries:
 - **`setup-allowances`** — one-shot provisioning of on-chain statement allowances via Sudo
 - **`statement-latency-bench`** — cohort/ring-topology latency benchmark
-- **`statement-ops-bench`** — per-node operation benchmark (submit / propagation / subscribe / loop / query)
+- **`statement-ops-bench`** — per-node operation benchmark (submit / propagation / subscribe / loop / query) plus account-quota admin (show-quota / set-quota)
 
 ## Building
 
@@ -224,3 +224,108 @@ submit endpoint=ws://A ok=100 fail=0 min=0.0042s avg=0.0061s max=0.0123s n=100
 propagation submit_endpoint=ws://A subscribe_endpoint=ws://B ok=10 fail=0 prop_min=0.012s prop_avg=0.034s prop_max=0.087s submit_avg=0.005s n=10
 subscribe endpoint=ws://A ok=10 fail=0 min=0.003s avg=0.005s max=0.011s n=10 seed=Submitted
 ```
+
+## Managing Account Quotas (`admin`)
+
+Each account's statement-store quota is an on-chain **allowance**
+(`StatementAllowance { max_count, max_size }`) stored under the unhashed key
+`":statement_allowance:" ++ account_id`. An account with **no allowance** (or a
+zeroed one) has every statement submission rejected, and any statements it already
+has in the store are automatically evicted by the nodes.
+
+The `statement-ops-bench admin` subcommand reads and sets this quota:
+
+- **`show-quota`** — read-only (`state_getStorage`); needs no key.
+- **`set-quota`** — writes via a `Sudo(System.set_storage)` extrinsic, so it needs
+  the chain's **sudo key**. It waits for finalization and reads the value back to verify.
+
+The account is given as an SS58 address **or** a 32-byte hex id (with or without `0x`).
+
+### 1. Read an account's quota
+
+```bash
+statement-ops-bench admin show-quota \
+  --rpc-endpoint ws://localhost:9944 \
+  --account 5DA1vuQ442HZQMkpk5idSUiQGrhJ6fkzW1rxETB7QviHvVRi
+```
+
+Prints one of:
+```
+account=30494cb9… quota: max_count=100000 max_size=1000000
+account=30494cb9… quota: max_count=0 max_size=0 (depleted)
+account=30494cb9… has NO quota set
+```
+
+### 2. Set an account's quota
+
+```bash
+statement-ops-bench admin set-quota \
+  --rpc-endpoint ws://localhost:9944 \
+  --account 5DA1vuQ442HZQMkpk5idSUiQGrhJ6fkzW1rxETB7QviHvVRi \
+  --sudo-seed //Alice \
+  --max-count 100000 \
+  --max-size 1000000
+```
+
+It submits the sudo extrinsic, waits for it to finalize, and re-reads the value;
+a successful run prints the new quota.
+
+**Providing the sudo key** — exactly one source is required:
+
+| Flag | Source |
+| ---- | ------ |
+| `--sudo-seed <SURI>`      | inline SURI (`//Alice`, a mnemonic, a `0x`-hex seed); also read from `STATEMENT_SUDO_SEED` |
+| `--sudo-seed-file <PATH>` | a file holding a SURI, or a substrate node keystore key file |
+| `--sudo-json <PATH>`      | a Polkadot-JS encrypted JSON account backup |
+
+For `--sudo-json`, supply the unlock password with `--sudo-password`,
+`STATEMENT_SUDO_PASSWORD`, `--sudo-password-file <PATH>`, or
+`--sudo-password-interactive` (hidden prompt). The `set-versi-quota.sh` helper
+wraps `set-quota` for a Polkadot-JS key (`versi_sudo.json`); see its header for usage.
+
+### 3. Clear all stored statements for an account
+
+Nodes automatically evict any statements that exceed an account's quota, so setting the
+quota to **0** effectively removes all of that account's statements from every node. The
+procedure is to read and record the current quota, set it to 0, wait ~5 minutes for the
+statements to be removed from all nodes, then **restore the original quota**.
+
+> ⚠️ **The restore step (4) is mandatory.** While the quota is 0 the account cannot
+> submit any statements — every submission is rejected. If you forget to restore it,
+> the account is effectively bricked until a non-zero quota is set again. **Record the
+> original values in step 1 before changing anything.**
+
+**Step 1 — read and RECORD the current quota** (you need these to restore):
+```bash
+statement-ops-bench admin show-quota \
+  --rpc-endpoint ws://localhost:9944 \
+  --account "$ACCOUNT"
+# Note the printed max_count and max_size, e.g. 100000 / 1000000.
+```
+
+**Step 2 — set the quota to 0** (causes each node to evict the account's statements):
+```bash
+statement-ops-bench admin set-quota \
+  --rpc-endpoint ws://localhost:9944 \
+  --account "$ACCOUNT" \
+  --sudo-seed //Alice \
+  --max-count 0 --max-size 0
+```
+
+**Step 3 — wait ~5 minutes** for the statements to be removed from all nodes. Optionally
+confirm with `query` that the account no longer appears:
+```bash
+statement-ops-bench query --rpc-endpoints ws://localhost:9944
+```
+
+**Step 4 — restore the original quota (VERY IMPORTANT):**
+```bash
+statement-ops-bench admin set-quota \
+  --rpc-endpoint ws://localhost:9944 \
+  --account "$ACCOUNT" \
+  --sudo-seed //Alice \
+  --max-count 100000 --max-size 1000000   # the values recorded in step 1
+```
+
+After step 4, `show-quota` again reports the original `max_count` / `max_size` and
+the account can submit statements again.
