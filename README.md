@@ -280,8 +280,7 @@ a successful run prints the new quota.
 
 For `--sudo-json`, supply the unlock password with `--sudo-password`,
 `STATEMENT_SUDO_PASSWORD`, `--sudo-password-file <PATH>`, or
-`--sudo-password-interactive` (hidden prompt). The `set-versi-quota.sh` helper
-wraps `set-quota` for a Polkadot-JS key (`versi_sudo.json`); see its header for usage.
+`--sudo-password-interactive` (hidden prompt).
 
 ### 3. Clear all stored statements for an account
 
