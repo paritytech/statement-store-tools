@@ -19,7 +19,7 @@
 //! Per-node statement-store operation benchmark.
 //!
 //! Complements the cohort-wide `statement-latency-bench` binary by measuring
-//! individual RPC operations on specific nodes. Five subcommands:
+//! individual RPC operations on specific nodes. Six subcommands:
 //!
 //! - `submit`      — `statement_submit` duration on each node.
 //! - `propagation` — submit→subscribe latency for each (submit, subscribe) pair.
@@ -28,6 +28,7 @@
 //! - `loop`        — periodically run the above.
 //! - `query`       — list statements currently in the store (optionally by topic), sorted by
 //!   expiry.
+//! - `admin`       — show or set an account's statement-store quota (allowance).
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
