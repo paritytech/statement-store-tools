@@ -1,7 +1,7 @@
 [package]
 name = "statement-store-tools"
 version = "0.1.0"
-description = "CLI tool for distributed statement store latency benchmarking"
+description = "CLI tools for distributed statement store latency benchmarking"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2021"
 license = "GPL-3.0-only"
@@ -16,21 +16,32 @@ path = "src/setup.rs"
 name = "statement-latency-bench"
 path = "src/bench.rs"
 
+[[bin]]
+name = "statement-ops-bench"
+path = "src/ops_bench.rs"
+
 [dependencies]
 anyhow = { version = "1.0.81", default-features = false }
-clap = { version = "4.5.13", features = ["derive"] }
+async-trait = "0.1.88"
+clap = { version = "4.5.13", features = ["derive", "env"] }
 codec = { package = "parity-scale-codec", version = "3.7.5", default-features = false }
 env_logger = "0.11.2"
+futures = "0.3.31"
 jsonrpsee = { version = "0.24.10", features = ["client-ws-transport-tls", "ws-client"] }
 log = { version = "0.4.22", default-features = false }
 rand = { version = "0.8.5", default-features = false }
+rpassword = "7"
 serde = { version = "1.0.214", features = ["derive"], default-features = false }
+serde_json = "1"
 subxt = { version = "0.50", features = ["jsonrpsee", "native"] }
-subxt-signer = "0.50"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+subxt-signer = { version = "0.50", features = ["polkadot-js-compat"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 # polkadot-sdk crates pinned by git rev (current paritytech/polkadot-sdk master).
 # Bump in lockstep with .github/workflows/ci.yml POLKADOT_SDK_REF.
 sc-statement-store = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076", features = ["test-helpers"] }
 sp-core = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076" }
 sp-statement-store = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "test-util"] }
