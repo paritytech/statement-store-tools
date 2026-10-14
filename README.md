@@ -462,3 +462,62 @@ statement-ops-bench admin set-quota \
 
 After step 4, `show-quota` again reports the original `max_count` / `max_size` and
 the account can submit statements again.
+
+## DHT Benchmark (`statement-dht-bench`)
+
+Loads a v2 DHT statement network for hours and audits that the DHT keeps every statement on
+exactly its K XOR-closest nodes. The defaults are the High scenario: 10,000
+accounts × 600 statements/h of 2,000 B (1,667 statements/s), an allowance of 5 per account, K = 20.
+
+Traffic:
+
+- **Load.** Every account submits at the same rate, round-robin over the nodes, each statement on
+  a fresh topic and without a channel, so the allowance evicts the account's oldest statement.
+- **Probes.** One per second from their own accounts, so no allowance evicts them. Each must sit
+  on exactly its K closest nodes once 60 s old, and again once 300 s old.
+- **Late reads.** Every 15 min a statement is written through the closest non-replica and read
+  20 s later on the farthest node. That node holds no copy, so the statement must reach it from
+  the replicas through its affinity filter. Once the read ends, the node must drop it within 60 s.
+
+Audits read every node store every 10 min through a match-all (`"any"`) subscription, which
+leaves the nodes' affinity filters, and so the DHT, untouched. A topic subscription changes the
+node's filter and makes its peers replay their stores to it: late reads do so on purpose, so keep
+them rare.
+
+Accounts: load `0..load_accounts`, then the probe accounts, then the late-read accounts. Provision all
+of them with the same allowance:
+
+```bash
+setup-allowances \
+  --rpc-endpoint ws://node0:9944 \
+  --sudo-seed "//Alice" \
+  --num-clients 10610 \
+  --allowance-max-count 5 \
+  --allowance-max-size 12000
+```
+
+Run, listing every statement node, as probes are checked against the K closest of them:
+
+```bash
+statement-dht-bench \
+  --rpc-endpoints ws://node0:9944,ws://node1:9944,...,ws://node39:9944 \
+  --replication-factor 20 \
+  --duration-secs 86400
+```
+
+Metrics on `--metrics-addr` (default `0.0.0.0:9615`):
+
+| Metric | Meaning |
+| --- | --- |
+| `statement_dht_submit_total{class,result}` | Submissions by class (`load`, `probe`, `late_read`) and node reply |
+| `statement_dht_load_skipped_total` | Load the bench skipped after falling more than a second behind |
+| `statement_dht_checks_total{check,result}` | Store checks: `placement`, `persistence` (probe on exactly its K replicas), `drop` (late reader's node dropped the statement); `ok` or `violation` |
+| `statement_dht_late_reads_total{result}` | `delivered`, `missed`, `local_copy`, `error` |
+| `statement_dht_late_read_seconds` | Late reader's subscription to the statement's arrival |
+| `statement_dht_audits_total{result}` | Audits: `ok`, or `failed` when a node store could not be read |
+
+The run refuses to start if two endpoints lead to the same node. Every violation is logged with
+the statement hash and the nodes involved, and every probe or late read a node did not accept with
+its reply. At the end the run logs every metric series and exits with an error if any check or
+late read failed, if the final audit could not read every node store, or if no probe placement was
+checked at all.
