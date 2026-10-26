@@ -20,6 +20,10 @@ path = "src/bench.rs"
 name = "statement-ops-bench"
 path = "src/ops_bench.rs"
 
+[[bin]]
+name = "statement-dht-bench"
+path = "src/dht_bench.rs"
+
 [dependencies]
 anyhow = { version = "1.0.81", default-features = false }
 async-trait = "0.1.88"
@@ -39,9 +43,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "syn
 
 # polkadot-sdk crates pinned by git rev (current paritytech/polkadot-sdk master).
 # Bump in lockstep with .github/workflows/ci.yml POLKADOT_SDK_REF.
+sc-network-types = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076" }
 sc-statement-store = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076", features = ["test-helpers"] }
 sp-core = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076" }
 sp-statement-store = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076", features = ["serde"] }
+substrate-prometheus-endpoint = { git = "https://github.com/paritytech/polkadot-sdk", rev = "1a69ade75f028819b70652a25a7ba4e9fa427076" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "test-util"] }
