@@ -23,17 +23,20 @@ use sp_statement_store::SubmitResult;
 use std::{net::SocketAddr, time::Duration};
 use substrate_prometheus_endpoint::{
 	prometheus::{Encoder, TextEncoder},
-	register, Counter, CounterVec, Histogram, HistogramOpts, Opts, Registry, U64,
+	register, Counter, CounterVec, HistogramOpts, HistogramVec, Opts, Registry, U64,
 };
+
+const LATENCY_BUCKETS: [f64; 12] =
+	[0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0];
 
 pub struct Metrics {
 	registry: Registry,
 	submit: CounterVec<U64>,
 	load_skipped: Counter<U64>,
 	checks: CounterVec<U64>,
-	late_reads: CounterVec<U64>,
-	late_read_seconds: Histogram,
-	audits: CounterVec<U64>,
+	resubscriptions: Counter<U64>,
+	replica_seconds: HistogramVec,
+	all_replicas_seconds: HistogramVec,
 }
 
 fn counter_vec(
@@ -43,6 +46,16 @@ fn counter_vec(
 	labels: &[&str],
 ) -> Result<CounterVec<U64>> {
 	Ok(register(CounterVec::new(Opts::new(name, help), labels)?, registry)?)
+}
+
+fn latency(registry: &Registry, name: &str, help: &str) -> Result<HistogramVec> {
+	Ok(register(
+		HistogramVec::new(
+			HistogramOpts::new(name, help).buckets(LATENCY_BUCKETS.to_vec()),
+			&["step"],
+		)?,
+		registry,
+	)?)
 }
 
 impl Metrics {
@@ -65,30 +78,25 @@ impl Metrics {
 			checks: counter_vec(
 				&registry,
 				"statement_dht_checks_total",
-				"Checks of node stores (placement, persistence, drop), by check and result.",
+				"Probe checks (delivery, restart, final), by check and result.",
 				&["check", "result"],
 			)?,
-			late_reads: counter_vec(
-				&registry,
-				"statement_dht_late_reads_total",
-				"Late reads, by result.",
-				&["result"],
-			)?,
-			late_read_seconds: register(
-				Histogram::with_opts(
-					HistogramOpts::new(
-						"statement_dht_late_read_seconds",
-						"Time from the late reader's subscription to the statement's arrival.",
-					)
-					.buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0]),
+			resubscriptions: register(
+				Counter::new(
+					"statement_dht_resubscriptions_total",
+					"Probe subscriptions opened again after a node dropped them.",
 				)?,
 				&registry,
 			)?,
-			audits: counter_vec(
+			replica_seconds: latency(
 				&registry,
-				"statement_dht_audits_total",
-				"Audits of every node store, by result.",
-				&["result"],
+				"statement_dht_probe_replica_seconds",
+				"Time from a probe's submission to its storage on one replica, by load step.",
+			)?,
+			all_replicas_seconds: latency(
+				&registry,
+				"statement_dht_probe_all_replicas_seconds",
+				"Time from a probe's submission to its storage on all K replicas, by load step.",
 			)?,
 			registry,
 		})
@@ -117,21 +125,22 @@ impl Metrics {
 		self.load_skipped.inc_by(count);
 	}
 
-	pub fn check(&self, check: &str, ok: bool) {
-		self.checks
-			.with_label_values(&[check, if ok { "ok" } else { "violation" }])
-			.inc();
+	pub fn check(&self, check: &str, result: &str, count: u64) {
+		self.checks.with_label_values(&[check, result]).inc_by(count);
 	}
 
-	pub fn late_read(&self, result: &str, latency: Option<Duration>) {
-		self.late_reads.with_label_values(&[result]).inc();
-		if let Some(latency) = latency {
-			self.late_read_seconds.observe(latency.as_secs_f64());
-		}
+	pub fn resubscribed(&self) {
+		self.resubscriptions.inc();
 	}
 
-	pub fn audit(&self, ok: bool) {
-		self.audits.with_label_values(&[if ok { "ok" } else { "failed" }]).inc();
+	pub fn replica_latency(&self, step: &str, latency: Duration) {
+		self.replica_seconds.with_label_values(&[step]).observe(latency.as_secs_f64());
+	}
+
+	pub fn all_replicas_latency(&self, step: &str, latency: Duration) {
+		self.all_replicas_seconds
+			.with_label_values(&[step])
+			.observe(latency.as_secs_f64());
 	}
 
 	/// Every series but the histogram buckets, one `name{labels} value` per line.
@@ -145,25 +154,29 @@ impl Metrics {
 			.join("\n"))
 	}
 
-	/// Probes checked for placement, whatever the result.
-	pub fn placements_checked(&self) -> u64 {
-		["ok", "violation"]
+	/// Probes checked for delivery, whatever the result.
+	pub fn deliveries_checked(&self) -> u64 {
+		["ok", "excused", "violation"]
 			.iter()
-			.map(|result| self.checks.with_label_values(&["placement", result]).get())
+			.map(|result| self.checks.with_label_values(&["delivery", result]).get())
 			.sum()
 	}
 
-	/// Outcomes that fail the run: a failed store check, and a late read that did not come
-	/// through the DHT.
+	/// Outcomes that fail the run: a failed probe check, and a statement a node refused to store.
 	pub fn violations(&self) -> u64 {
-		let checks = ["placement", "persistence", "drop"]
+		let checks = [
+			("delivery", "violation"),
+			("restart", "violation"),
+			("final", "lost"),
+			("final", "undelivered"),
+		]
+		.iter()
+		.map(|(check, result)| self.checks.with_label_values(&[check, result]).get())
+		.sum::<u64>();
+		let rejected = ["load", "probe"]
 			.iter()
-			.map(|check| self.checks.with_label_values(&[check, "violation"]).get())
+			.map(|class| self.submit.with_label_values(&[class, "rejected"]).get())
 			.sum::<u64>();
-		let reads = ["missed", "local_copy", "error"]
-			.iter()
-			.map(|result| self.late_reads.with_label_values(&[result]).get())
-			.sum::<u64>();
-		checks + reads
+		checks + rejected
 	}
 }

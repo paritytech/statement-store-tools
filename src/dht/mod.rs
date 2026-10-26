@@ -16,17 +16,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! A v2 DHT statement network under a constant statement load from many accounts, with probes,
-//! late reads and periodic audits that check the DHT keeps every statement on exactly its K
-//! XOR-closest nodes.
+//! A v2 DHT statement network under a stepped statement load from many accounts, with probes that
+//! time how long a statement takes to reach its K XOR-closest nodes and check that it stays there.
 
-pub mod audit;
 pub mod load;
 pub mod metrics;
 pub mod node;
+pub mod probes;
 
 use anyhow::{anyhow, ensure, Result};
 use clap::Parser;
+use load::{Schedule, Step};
 use log::{info, warn};
 use sc_statement_store::test_utils::get_keypair;
 use sp_core::{blake2_256, sr25519};
@@ -35,13 +35,16 @@ use std::{
 	collections::HashSet,
 	net::SocketAddr,
 	sync::Arc,
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
+
+/// Time the nodes get to advertise their new affinity filters before the load starts.
+const FILTER_SETTLE: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "statement-dht-bench")]
-#[command(about = "Load a v2 DHT statement network and audit statement placement")]
+#[command(about = "Load a v2 DHT statement network step by step and time statement delivery")]
 pub struct Args {
 	/// RPC WebSocket endpoints of every statement node in the network.
 	#[arg(long, value_delimiter = ',', required = true)]
@@ -52,23 +55,24 @@ pub struct Args {
 	pub replication_factor: usize,
 
 	/// Statement allowance count each account was provisioned with.
-	#[arg(long, default_value_t = 5)]
+	#[arg(long, default_value_t = 2_000)]
 	pub allowance_max_count: u64,
 
 	/// Load accounts: `setup-allowances` indices `0..load_accounts`.
 	#[arg(long, default_value_t = 10_000)]
 	pub load_accounts: u32,
 
-	/// Statements each load account submits per hour.
-	#[arg(long, default_value_t = 600)]
-	pub rate_per_hour: u32,
+	/// Load steps as `statements_per_second:seconds`, run in order. The load stops after the last
+	/// one; the probes go on until the end of the run.
+	#[arg(long, value_delimiter = ',', required = true)]
+	pub load_steps: Vec<Step>,
 
 	/// Statement payload size in bytes.
-	#[arg(long, default_value_t = 2_000)]
+	#[arg(long, default_value_t = 1_000)]
 	pub payload_size: usize,
 
 	/// Validity of load statements in seconds.
-	#[arg(long, default_value_t = 600)]
+	#[arg(long, default_value_t = 14_400)]
 	pub load_expiry_secs: u64,
 
 	/// Upper bound on load submissions awaiting a reply.
@@ -79,49 +83,24 @@ pub struct Args {
 	#[arg(long, default_value_t = 600)]
 	pub probe_accounts: u32,
 
-	/// Milliseconds between placement probes.
-	#[arg(long, default_value_t = 1_000)]
+	/// Milliseconds between probes.
+	#[arg(long, default_value_t = 200)]
 	pub probe_interval_ms: u64,
 
-	/// Late-read accounts, the indices right after the probe accounts.
-	#[arg(long, default_value_t = 10)]
-	pub late_read_accounts: u32,
+	/// Topics the probes rotate over. Every node subscribes to those it is a replica of.
+	#[arg(long, default_value_t = 200)]
+	pub probe_topics: usize,
 
-	/// Seconds between late reads. Each one changes the reader node's affinity filter, which
-	/// makes its peers replay their stores to it, so keep them rare.
-	#[arg(long, default_value_t = 900)]
-	pub late_read_interval_secs: u64,
-
-	/// Seconds a late reader waits after the write before it subscribes.
-	#[arg(long, default_value_t = 20)]
-	pub late_read_delay_secs: u64,
-
-	/// Seconds a late reader waits for the statement once subscribed.
-	#[arg(long, default_value_t = 60)]
-	pub late_read_timeout_secs: u64,
-
-	/// Validity of probe and late-read statements in seconds.
-	#[arg(long, default_value_t = 1_800)]
+	/// Validity of probes in seconds.
+	#[arg(long, default_value_t = 14_400)]
 	pub probe_expiry_secs: u64,
 
-	/// Seconds between audits of every node store.
-	#[arg(long, default_value_t = 600)]
-	pub audit_interval_secs: u64,
-
-	/// Age in seconds from which a probe must sit on exactly its K replicas.
+	/// Seconds within which a probe must reach all K replicas.
 	#[arg(long, default_value_t = 60)]
-	pub placement_age_secs: u64,
+	pub probe_deadline_secs: u64,
 
-	/// Age in seconds from which a probe is checked again on the same K replicas.
-	#[arg(long, default_value_t = 300)]
-	pub persistence_age_secs: u64,
-
-	/// Seconds after a late reader unsubscribes by which its node must drop the statement.
-	#[arg(long, default_value_t = 60)]
-	pub drop_age_secs: u64,
-
-	/// Run length in seconds.
-	#[arg(long, default_value_t = 86_400)]
+	/// Run length in seconds: the load steps, then probes alone.
+	#[arg(long, default_value_t = 6_000)]
 	pub duration_secs: u64,
 
 	/// Prometheus exposition address.
@@ -132,37 +111,51 @@ pub struct Args {
 impl Args {
 	fn validate(&self) -> Result<()> {
 		let nodes = self.rpc_endpoints.len();
-		// A late read writes through the closest non-replica and reads on the farthest node.
 		ensure!(
-			nodes >= self.replication_factor + 2,
-			"{nodes} endpoints leave no room for a late read with K={}",
+			nodes > self.replication_factor,
+			"{nodes} endpoints leave no non-replica to write probes through with K={}",
 			self.replication_factor
 		);
 		ensure!(
-			self.rate_per_hour > 0 && self.load_accounts > 0,
-			"the load needs accounts and a rate"
+			self.load_accounts > 0 && self.probe_accounts > 0,
+			"the load and the probes need accounts"
 		);
 		ensure!(
-			self.probe_accounts > 0 && self.late_read_accounts > 0,
-			"probes and late reads need accounts"
+			self.probe_topics > 0 && self.probe_interval_ms > 0,
+			"the probes need topics and an interval"
 		);
-		// Every check of a probe or late read lands at the first audit after its age is reached.
-		let last_check =
-			self.persistence_age_secs.max(self.drop_age_secs) + self.audit_interval_secs;
+		let schedule = Schedule(self.load_steps.clone());
 		ensure!(
-			self.probe_expiry_secs > last_check,
-			"probes and late reads expire after {}s, before their last check at up to {last_check}s",
+			schedule.secs() <= self.duration_secs,
+			"the load steps last {}s, longer than the {}s run",
+			schedule.secs(),
+			self.duration_secs
+		);
+		// Nothing may expire during the run: a node reaps at most 10,000 expired statements per
+		// 31 s, far slower than this load adds new ones.
+		ensure!(
+			self.load_expiry_secs > self.duration_secs,
+			"load statements expire after {}s, within the {}s run",
+			self.load_expiry_secs,
+			self.duration_secs
+		);
+		ensure!(
+			self.probe_expiry_secs > self.duration_secs + self.probe_deadline_secs,
+			"probes expire after {}s, before the final check",
 			self.probe_expiry_secs
 		);
-		// A probe or late read must never be evicted by its own account's allowance.
-		for (class, accounts, interval) in [
-			("probe", self.probe_accounts, self.probe_interval_ms as f64 / 1000.0),
-			("late-read", self.late_read_accounts, self.late_read_interval_secs as f64),
+		// Nothing may be evicted: a node holds K/N of an account's load, but all of a probe
+		// account's probes, as such an account may write to one topic only.
+		let load_share = self.replication_factor as f64 / nodes as f64;
+		let probes = self.duration_secs * 1_000 / self.probe_interval_ms;
+		for (class, statements, accounts, share) in [
+			("load", schedule.total(), self.load_accounts, load_share),
+			("probe", probes, self.probe_accounts, 1.0),
 		] {
-			let live = (self.probe_expiry_secs as f64 / (accounts as f64 * interval)).ceil() as u64;
+			let per_node = (statements as f64 / accounts as f64 * share).ceil() as u64;
 			ensure!(
-				live < self.allowance_max_count,
-				"each {class} account would hold {live} live statements, allowance {}",
+				per_node < self.allowance_max_count,
+				"each {class} account would hold {per_node} statements per node, allowance {}",
 				self.allowance_max_count
 			);
 		}
@@ -220,8 +213,7 @@ pub async fn run(args: Args) -> Result<()> {
 	);
 
 	let probe_start = args.load_accounts;
-	let late_start = probe_start + args.probe_accounts;
-	let total = late_start + args.late_read_accounts;
+	let total = probe_start + args.probe_accounts;
 	info!("Deriving {total} account keys");
 	let accounts: Vec<sr25519::Pair> =
 		tokio::task::spawn_blocking(move || (0..total).map(get_keypair).collect()).await?;
@@ -235,8 +227,7 @@ pub async fn run(args: Args) -> Result<()> {
 		replication_factor: args.replication_factor,
 		run_id,
 	});
-	let tracker = Arc::new(Mutex::new(audit::Tracker::default()));
-	let (stop_tx, stop_rx) = watch::channel(false);
+	let schedule = Schedule(args.load_steps.clone());
 
 	let metrics_task = {
 		let bench = bench.clone();
@@ -248,64 +239,87 @@ pub async fn run(args: Args) -> Result<()> {
 		})
 	};
 
-	let rate = args.load_accounts as f64 * args.rate_per_hour as f64 / 3600.0;
-	info!(
-		"Run {run_id}: {} nodes, K={}, {rate:.0} statements/s of {} B from {} accounts for {}s",
+	// Subscribe while the stores are empty: each subscription makes the node's peers replay their
+	// stores to it.
+	let pool = Arc::new(probes::Pool::new(&bench, args.probe_topics));
+	let tracker = Arc::new(Mutex::new(probes::Tracker::new(
 		bench.nodes.len(),
 		args.replication_factor,
+		schedule.clone(),
+	)));
+	let (mut watchers, mut opened) = (Vec::new(), Vec::new());
+	for node in pool.watched() {
+		let (tx, rx) = oneshot::channel();
+		watchers.push(tokio::spawn(probes::watch(
+			bench.clone(),
+			pool.clone(),
+			tracker.clone(),
+			node,
+			tx,
+		)));
+		opened.push(rx);
+	}
+	for rx in opened {
+		rx.await.map_err(|_| anyhow!("a probe watcher exited before subscribing"))??;
+	}
+	info!(
+		"Run {run_id}: {} nodes, K={}, probes subscribed on {} nodes; load steps {} of {} B from \
+		 {} accounts, then probes alone until {}s",
+		bench.nodes.len(),
+		args.replication_factor,
+		pool.watched().count(),
+		schedule
+			.0
+			.iter()
+			.map(|s| format!("{}/s×{}s", s.rate, s.secs))
+			.collect::<Vec<_>>()
+			.join(", "),
 		args.payload_size,
 		args.load_accounts,
 		args.duration_secs
 	);
+	tokio::time::sleep(FILTER_SETTLE).await;
 
-	let probe_validity = Duration::from_secs(args.probe_expiry_secs);
-	let checks = audit::Ages {
-		placement: Duration::from_secs(args.placement_age_secs),
-		persistence: Duration::from_secs(args.persistence_age_secs),
-		drop: Duration::from_secs(args.drop_age_secs),
-	};
+	let started = Instant::now();
+	let deadline = Duration::from_secs(args.probe_deadline_secs);
+	let (stop_tx, stop_rx) = watch::channel(false);
 	let tasks = vec![
 		tokio::spawn(load::run(
 			bench.clone(),
 			load::Load {
 				accounts: 0..args.load_accounts as usize,
-				rate,
+				schedule: schedule.clone(),
 				size: args.payload_size,
 				validity: Duration::from_secs(args.load_expiry_secs),
 				max_in_flight: args.max_in_flight,
 			},
+			started,
 			stop_rx.clone(),
 		)),
-		tokio::spawn(audit::probes(
+		tokio::spawn(probes::submit(
 			bench.clone(),
+			pool.clone(),
 			tracker.clone(),
-			probe_start as usize..late_start as usize,
-			Duration::from_millis(args.probe_interval_ms),
-			args.payload_size,
-			probe_validity,
-			stop_rx.clone(),
-		)),
-		tokio::spawn(audit::late_reads(
-			bench.clone(),
-			tracker.clone(),
-			audit::LateReadConfig {
-				accounts: late_start as usize..total as usize,
-				interval: Duration::from_secs(args.late_read_interval_secs),
-				delay: Duration::from_secs(args.late_read_delay_secs),
-				timeout: Duration::from_secs(args.late_read_timeout_secs),
+			probes::Probes {
+				accounts: probe_start as usize..total as usize,
+				interval: Duration::from_millis(args.probe_interval_ms),
 				size: args.payload_size,
-				validity: probe_validity,
+				validity: Duration::from_secs(args.probe_expiry_secs),
 			},
-			stop_rx.clone(),
-		)),
-		tokio::spawn(audit::audits(
-			bench.clone(),
-			tracker.clone(),
-			Duration::from_secs(args.audit_interval_secs),
-			checks.clone(),
+			schedule,
+			started,
 			stop_rx,
 		)),
 	];
+	// Settling outlives the writes by one deadline, so the last probes get the same deadline.
+	let (settle_stop_tx, settle_stop_rx) = watch::channel(false);
+	let settle = tokio::spawn(probes::settle(
+		bench.clone(),
+		pool.clone(),
+		tracker.clone(),
+		deadline,
+		settle_stop_rx,
+	));
 
 	tokio::select! {
 		_ = tokio::time::sleep(Duration::from_secs(args.duration_secs)) => {},
@@ -315,14 +329,35 @@ pub async fn run(args: Args) -> Result<()> {
 	for task in tasks {
 		task.await?;
 	}
-	let final_audit = audit::audit(&bench, &tracker, &checks).await;
+	tokio::time::sleep(deadline).await;
+	settle_stop_tx
+		.send(true)
+		.map_err(|_| anyhow!("probe settling exited before the stop"))?;
+	settle.await?;
+	tracker.lock().await.settle(&bench, &pool, Instant::now(), Duration::ZERO);
+	let final_read = probes::final_check(&bench, &pool, &tracker).await;
+	let (report, catch_up) = {
+		let mut tracker = tracker.lock().await;
+		(tracker.report(), tracker.catch_up_report(&bench, Instant::now()))
+	};
+	for watcher in watchers {
+		watcher.abort();
+	}
 	metrics_task.abort();
+	warn!(
+		"Probe subscriptions closed: every watched node's affinity filter changes, so its peers \
+		 replay their stores to it"
+	);
 
+	info!("Run {run_id} probe delivery by load step:\n{report}");
+	if !catch_up.is_empty() {
+		info!("Run {run_id} catch-up of the nodes that went offline:\n{catch_up}");
+	}
 	info!("Run {run_id} totals:\n{}", bench.metrics.summary()?);
 	let violations = bench.metrics.violations();
 	ensure!(violations == 0, "run {run_id} ended with {violations} violations");
-	ensure!(final_audit, "run {run_id}: the final audit could not read every node store");
-	ensure!(bench.metrics.placements_checked() > 0, "run {run_id} checked no probe placement");
+	ensure!(final_read, "run {run_id}: the final check could not read every watched node");
+	ensure!(bench.metrics.deliveries_checked() > 0, "run {run_id} checked no probe delivery");
 	info!("Run {run_id} ended without violations");
 	Ok(())
 }

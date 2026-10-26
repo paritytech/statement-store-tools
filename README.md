@@ -465,59 +465,86 @@ the account can submit statements again.
 
 ## DHT Benchmark (`statement-dht-bench`)
 
-Loads a v2 DHT statement network for hours and audits that the DHT keeps every statement on
-exactly its K XOR-closest nodes. The defaults are the High scenario: 10,000
-accounts × 600 statements/h of 2,000 B (1,667 statements/s), an allowance of 5 per account, K = 20.
+Loads a v2 DHT statement network step by step and times how long a statement takes to reach its K
+XOR-closest nodes, and checks that it stays there, across node restarts too. Nothing expires during
+a run, so every node's store grows by its K/N share of the load.
 
 Traffic:
 
-- **Load.** Every account submits at the same rate, round-robin over the nodes, each statement on
-  a fresh topic and without a channel, so the allowance evicts the account's oldest statement.
-- **Probes.** One per second from their own accounts, so no allowance evicts them. Each must sit
-  on exactly its K closest nodes once 60 s old, and again once 300 s old.
-- **Late reads.** Every 15 min a statement is written through the closest non-replica and read
-  20 s later on the farthest node. That node holds no copy, so the statement must reach it from
-  the replicas through its affinity filter. Once the read ends, the node must drop it within 60 s.
+- **Load.** The accounts submit in turn, round-robin over the nodes, each statement on a fresh
+  topic and without a channel. The rate follows `--load-steps` and stops after the last step.
+- **Probes.** Five per second from their own accounts, rotating over a fixed pool of 200 topics,
+  each written through a node that is not a replica of its topic.
 
-Audits read every node store every 10 min through a match-all (`"any"`) subscription, which
-leaves the nodes' affinity filters, and so the DHT, untouched. A topic subscription changes the
-node's filter and makes its peers replay their stores to it: late reads do so on purpose, so keep
-them rare.
+Before the load starts, every node subscribes to the pool topics it is a replica of, and the
+subscriptions stay open for the whole run. A topic subscription changes the node's affinity filter,
+and on every filter change its peers replay their whole stores to it, so the subscriptions open
+while the stores are empty. A bench restart mid-run or a dropped subscription costs each affected
+node such a replay, and so does the bench's exit.
 
-Accounts: load `0..load_accounts`, then the probe accounts, then the late-read accounts. Provision all
-of them with the same allowance:
+Checks:
+
+- **Delivery.** A probe must reach all K replicas within `--probe-deadline-secs`. A replica that was
+  offline meanwhile is excused but owes the probe until its peers' replay delivers it.
+- **Restart.** When a node comes back, the bench subscribes again, and the replay must hold every
+  probe the node had stored before.
+- **Final.** At the end every node is read through a second subscription to the same topics, which
+  leaves its filter unchanged. A probe gone from a replica that had stored it is `lost`, and one a
+  replica never stored although it was online at the deadline is `undelivered`. Both fail the run.
+  A probe a returned replica still owes is `catching_up`, reported but not a failure.
+
+The end of the run also reports each node that went offline: how long it was away and how long it
+took after its return to store every probe it missed, or how many it still misses.
+
+Accounts: load `0..load_accounts`, then the probe accounts. Provision all of them with the same
+allowance, above what a node holds per account (the bench refuses to start otherwise): the K/N
+share of an account's load, and all of a probe account's probes, as an account may keep writing to
+one probe topic.
 
 ```bash
 setup-allowances \
   --rpc-endpoint ws://node0:9944 \
   --sudo-seed "//Alice" \
-  --num-clients 10610 \
-  --allowance-max-count 5 \
-  --allowance-max-size 12000
+  --num-clients 10600 \
+  --allowance-max-count 2000 \
+  --allowance-max-size 3000000
 ```
 
 Run, listing every statement node, as probes are checked against the K closest of them:
 
 ```bash
 statement-dht-bench \
-  --rpc-endpoints ws://node0:9944,ws://node1:9944,...,ws://node39:9944 \
+  --rpc-endpoints ws://node0:9944,ws://node1:9944,...,ws://node79:9944 \
   --replication-factor 20 \
-  --duration-secs 86400
+  --load-steps 2500:600,5000:600,10000:600,15000:1980,2500:300 \
+  --duration-secs 6000
+```
+
+These steps write 40.95M statements, ~10.2M per node with K = 20 of 80 nodes. A full store refuses
+new statements (`StoreFull`) instead of evicting old ones, and the node defaults stop at 4,194,304
+statements and 2 GiB, so run the nodes with room for the busiest one, e.g.
+`--statement-store-max-total-statements 16000000 --statement-store-max-total-size 21474836480`.
+
+Every minute the run logs the probe delivery of that minute per load step, and at the end the
+delivery over the whole run, in this shape:
+
+```text
+  <step>:<rate>/s: <n> probes, <n> on all replicas in time; all replicas p50 <s> p90 <s> p99 <s> max <s>; one replica p50 <s> p99 <s>
 ```
 
 Metrics on `--metrics-addr` (default `0.0.0.0:9615`):
 
 | Metric | Meaning |
 | --- | --- |
-| `statement_dht_submit_total{class,result}` | Submissions by class (`load`, `probe`, `late_read`) and node reply |
+| `statement_dht_submit_total{class,result}` | Submissions by class (`load`, `probe`) and node reply |
 | `statement_dht_load_skipped_total` | Load the bench skipped after falling more than a second behind |
-| `statement_dht_checks_total{check,result}` | Store checks: `placement`, `persistence` (probe on exactly its K replicas), `drop` (late reader's node dropped the statement); `ok` or `violation` |
-| `statement_dht_late_reads_total{result}` | `delivered`, `missed`, `local_copy`, `error` |
-| `statement_dht_late_read_seconds` | Late reader's subscription to the statement's arrival |
-| `statement_dht_audits_total{result}` | Audits: `ok`, or `failed` when a node store could not be read |
+| `statement_dht_checks_total{check,result}` | `delivery` (`ok`, `excused`, `violation`) per probe; `restart` (`ok`, `violation`) per probe and replica; `final` (`ok`, `lost`, `catching_up`) per probe and replica, `undelivered` per probe |
+| `statement_dht_resubscriptions_total` | Probe subscriptions opened again after a node dropped them |
+| `statement_dht_probe_replica_seconds{step}` | Probe submission to its storage on one replica |
+| `statement_dht_probe_all_replicas_seconds{step}` | Probe submission to its storage on all K replicas |
 
-The run refuses to start if two endpoints lead to the same node. Every violation is logged with
-the statement hash and the nodes involved, and every probe or late read a node did not accept with
-its reply. At the end the run logs every metric series and exits with an error if any check or
-late read failed, if the final audit could not read every node store, or if no probe placement was
-checked at all.
+The run refuses to start if two endpoints lead to the same node. A delivery violation is logged
+with the probe hash, its topic and the nodes involved; the restart and final checks log a count per
+node with one example hash. At the end the run logs every metric series and exits with an error if
+any check failed, if a node refused a statement (`rejected`, e.g. a full store), if the final check
+could not read every node, or if no probe was checked at all.

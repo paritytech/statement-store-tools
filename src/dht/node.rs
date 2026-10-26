@@ -38,7 +38,10 @@ pub struct Node {
 	pub endpoint: String,
 	/// `blake2_256` of the node's peer id bytes, the key its DHT replica rank derives from.
 	pub dht_key: [u8; 32],
-	client: RwLock<Arc<WsClient>>,
+	requests: RwLock<Arc<WsClient>>,
+	/// Kept apart from `requests`: the node drops a subscription whose events back up behind the
+	/// load's replies.
+	subscriptions: RwLock<Arc<WsClient>>,
 }
 
 async fn connect(endpoint: &str) -> Result<WsClient> {
@@ -61,17 +64,18 @@ impl Node {
 		Ok(Self {
 			endpoint: endpoint.to_string(),
 			dht_key: blake2_256(&peer_id.to_bytes()),
-			client: RwLock::new(Arc::new(client)),
+			requests: RwLock::new(Arc::new(client)),
+			subscriptions: RwLock::new(Arc::new(connect(endpoint).await?)),
 		})
 	}
 
-	/// The node's client, reconnected first if the connection dropped: a run lasts a day.
-	async fn client(&self) -> Result<Arc<WsClient>> {
-		let current = self.client.read().await.clone();
+	/// The client of `connection`, reconnected first if it dropped, e.g. when the node restarted.
+	async fn client(&self, connection: &RwLock<Arc<WsClient>>) -> Result<Arc<WsClient>> {
+		let current = connection.read().await.clone();
 		if current.is_connected() {
 			return Ok(current);
 		}
-		let mut client = self.client.write().await;
+		let mut client = connection.write().await;
 		if !client.is_connected() {
 			*client = Arc::new(connect(&self.endpoint).await?);
 		}
@@ -80,7 +84,7 @@ impl Node {
 
 	pub async fn submit(&self, statement: &Statement) -> Result<SubmitResult> {
 		let encoded: Bytes = statement.encode().into();
-		self.client()
+		self.client(&self.requests)
 			.await?
 			.request("statement_submit", rpc_params![encoded])
 			.await
@@ -88,7 +92,7 @@ impl Node {
 	}
 
 	pub async fn subscribe(&self, filter: TopicFilter) -> Result<Subscription<StatementEvent>> {
-		self.client()
+		self.client(&self.subscriptions)
 			.await?
 			.subscribe(
 				"statement_subscribeStatement",
@@ -99,10 +103,14 @@ impl Node {
 			.map_err(|e| anyhow!("statement_subscribeStatement failed on {}: {e}", self.endpoint))
 	}
 
-	/// Pass every statement stored on the node to `visit`. A match-all filter names no topic, so
-	/// the read leaves the node's advertised affinity, and with it the DHT, untouched.
-	pub async fn read_store(&self, mut visit: impl FnMut(&[u8])) -> Result<()> {
-		let mut subscription = self.subscribe(TopicFilter::Any).await?;
+	/// Pass every statement the node stores under `filter` to `visit`. The read leaves the node's
+	/// advertised affinity untouched only while another subscription already names its topics.
+	pub async fn read_store(
+		&self,
+		filter: TopicFilter,
+		mut visit: impl FnMut(&[u8]),
+	) -> Result<()> {
+		let mut subscription = self.subscribe(filter).await?;
 		loop {
 			let event = tokio::time::timeout(REPLAY_STALL, subscription.next())
 				.await

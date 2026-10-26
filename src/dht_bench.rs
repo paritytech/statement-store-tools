@@ -16,8 +16,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! `statement-dht-bench`: loads a v2 DHT statement network for hours and audits that the DHT
-//! keeps statements on exactly their K XOR-closest nodes. See [`dht`].
+//! `statement-dht-bench`: loads a v2 DHT statement network step by step and times how long a
+//! statement takes to reach its K XOR-closest nodes. See [`dht`].
 
 mod dht;
 
